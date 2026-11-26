@@ -23,8 +23,8 @@ final class TelemetryHost {
         static let payloadTooLarge = 413
         static let endpointPath = "/v1/telemetry/events"
 
-        /// 随 platforms/ios/EduSDK 的发布版本手动同步。
-        static let sdkVersion = "0.1.0"
+        /// 由 scripts/release-sdk.py 的 VERSION_PATTERNS 统一改写，release:check 会校验一致性。
+        static let sdkVersion = "0.1.2"
     }
 
     private let defaults: UserDefaults

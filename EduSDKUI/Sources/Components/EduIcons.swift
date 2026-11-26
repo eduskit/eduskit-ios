@@ -119,5 +119,6 @@ public enum EduIcons {
     public static let remove = "remove"
     public static let addCircle = "add_circle"
     public static let moreHoriz = "more_horiz"
+    public static let person = "person"
     public static let personOff = "person_off"
 }

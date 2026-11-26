@@ -27,56 +27,52 @@ struct ParticipantVideoTile: View {
     /// 不可见时卸槽，避免侧栏收起仍拉远端视频。
     var bindVideo: Bool = true
     var showLiveBadge: Bool = false
-
-    private var initials: String {
-        if let initials = participant.initials { return initials }
-        let parts = participant.displayName.split(separator: " ").prefix(2)
-        return parts.map { String($0.prefix(1)) }.joined()
-    }
+    var fixedWidth: CGFloat? = nil
+    @Environment(\.liveUiSnapshot) private var liveSnapshot
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
             // 阴影只能挂在背景 shape 上，不能包住 RtcVideoSlotView：
             // SwiftUI `.clipShape` / `.shadow` 会离屏拍图，TRTC Metal 层会被拍成空白。
-            RoundedRectangle(cornerRadius: EduDimens.radiusXl)
+            RoundedRectangle(cornerRadius: MobileClassroomTokens.cardRadius)
                 .fill(EduColors.surfaceHighest)
                 .eduShadow(.soft)
-            CenteredTileAvatar(
-                avatarUrl: participant.avatarUrl,
-                initials: initials,
-                size: featured
-                    ? EduDimens.tileAvatarSizeFeatured
-                    : (compact ? EduDimens.tileAvatarSizeCompact : EduDimens.tileAvatarSize),
-                fontSize: featured
-                    ? EduDimens.tileAvatarFontFeatured
-                    : (compact ? EduDimens.tileAvatarFontCompact : EduDimens.tileAvatarFont)
-            )
-            if bindVideo {
-                RtcVideoSlotView(userId: participant.id, cornerRadius: EduDimens.radiusXl)
+            let avatarSize = featured
+                ? EduDimens.tileAvatarSizeFeatured
+                : (compact ? EduDimens.tileAvatarSizeCompact : EduDimens.tileAvatarSize)
+            CenteredTileAvatar(avatarUrl: participant.avatarUrl, size: avatarSize)
+            let liveName = liveSnapshot.flatMap { LiveStreams.byUser($0)[participant.id] }
+            let showCamera = showsParticipantCameraSurface(videoMuted: participant.videoMuted)
+            if let liveName, showsParticipantLiveSurface(liveStreamName: liveName) {
+                LiveVideoSlotView(streamName: liveName, cornerRadius: MobileClassroomTokens.cardRadius)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .allowsHitTesting(false)
+                if !showCamera {
+                    EduColors.surfaceHighest.frame(maxWidth: .infinity, maxHeight: .infinity)
+                    CenteredTileAvatar(avatarUrl: participant.avatarUrl, size: avatarSize)
+                }
+            } else if showCamera, bindVideo {
+                RtcVideoSlotView(userId: participant.id, cornerRadius: MobileClassroomTokens.cardRadius)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .allowsHitTesting(false)
             }
-            LinearGradient(
-                colors: [.clear, .black.opacity(0.55)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            HStack(spacing: 4) {
-                if participant.audioMuted {
-                    EduIcon(EduIcons.micOff, size: 12, tint: EduColors.error)
+            VStack {
+                HStack {
+                    Text(participant.displayName).font(.system(size: 12, weight: .semibold)).foregroundStyle(.white).lineLimit(1)
+                        .padding(.horizontal, 6).padding(.vertical, 2).background(.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 6))
+                    Spacer(minLength: 0)
                 }
-                if participant.videoMuted {
-                    EduIcon(EduIcons.videocamOff, size: 12, tint: EduColors.error)
+                Spacer(minLength: 0)
+                HStack(spacing: 4) {
+                    EduIcon(participant.audioMuted ? EduIcons.micOff : EduIcons.mic, size: 14, tint: participant.audioMuted ? Color(hex: 0xFF6B8A) : .white)
+                        .frame(width: 24, height: 24).background(.black.opacity(0.45), in: Circle())
+                    EduIcon(participant.videoMuted ? EduIcons.videocamOff : EduIcons.videocam, size: 14, tint: .white)
+                        .frame(width: 24, height: 24).background(.black.opacity(0.45), in: Circle())
+                    Spacer(minLength: 0)
                 }
-                Text(participant.displayName.uppercased())
-                    .font(EduFont.sans(10, weight: .semibold))
-                    .tracking(0.5)
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-            }
-            .padding(8)
+            }.padding(compact ? 8 : 6)
         }
-        .overlay(alignment: .bottomTrailing) {
+        .overlay(alignment: .topTrailing) {
             if showLiveBadge {
                 VideoLiveBadge()
                     .padding(VideoLiveBadgeTokens.inset)
@@ -87,7 +83,7 @@ struct ParticipantVideoTile: View {
             maxWidth: featured ? .infinity : nil,
             maxHeight: featured ? .infinity : nil
         )
-        .frame(width: featured ? nil : (compact ? EduDimens.bloomCardW : EduDimens.videoTileW))
+        .frame(width: featured ? nil : (fixedWidth ?? (compact ? EduDimens.bloomCardW : EduDimens.videoTileW)))
     }
 }
 
@@ -110,13 +106,7 @@ struct ParticipantListItemView: View {
         // Web `.edu-plist__item` pad 8; `.edu-plist__person` gap 16.
         HStack(spacing: dense ? 12 : 16) {
             ZStack(alignment: .bottomTrailing) {
-                RemoteAvatarImage(avatarUrl: participant.avatarUrl) {
-                    Text(participant.initials ?? String(participant.displayName.prefix(2)).uppercased())
-                        .font(EduFont.sans(14, weight: .bold))
-                        .foregroundStyle(EduColors.onSurfaceVariant)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(EduColors.surfaceHigh)
-                }
+                RemoteAvatarImage(avatarUrl: participant.avatarUrl)
                     .frame(width: 40, height: 40)
                     .clipShape(Circle())
                     .overlay(Circle().stroke(EduColors.surfaceLow, lineWidth: 2))

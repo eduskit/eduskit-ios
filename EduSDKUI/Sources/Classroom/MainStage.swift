@@ -1,40 +1,25 @@
 import EduSDK
 
 extension UiSnapshot {
-    func isTeacherVideoMainStage() -> Bool {
-        let phase = joinProgress.phase
-        return (phase == .domainsInitializing || phase == .joined) &&
-            joinProgress.whiteboard == .disabled
-    }
-
-    func featuredTeacherParticipant() -> ClassroomParticipant? {
-        let id = teacherUserId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !id.isEmpty else { return nil }
-        let member = members.first { $0.userId == id }
-        let displayName: String = {
-            if let name = member?.displayName, !name.isEmpty { return name }
-            if let name = teacherDisplayName, !name.isEmpty { return name }
-            return id
-        }()
-        let stream = streamInfos.first { $0.userId == id }
-        return ClassroomParticipant(
-            id: id,
-            displayName: displayName,
-            roleLabel: member?.role,
-            avatarUrl: member?.avatarUrl ?? teacherAvatarUrl,
-            initials: nil,
-            onStage: true,
-            audioMuted: stream?.audioMuted ?? true,
-            videoMuted: stream?.videoMuted ?? true
-        )
-    }
+    func isTeacherVideoMainStage() -> Bool { classroomView.teacherVideoStage }
+    func featuredTeacherParticipant() -> ClassroomParticipant? { featuredTeacher }
 }
 
-func stripParticipantsExcludingTeacher(
-    _ stageParticipants: [ClassroomParticipant],
-    teacherUserId: String?
-) -> [ClassroomParticipant] {
-    let id = teacherUserId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    guard !id.isEmpty else { return stageParticipants }
-    return stageParticipants.filter { $0.id != id }
+/// 正在共享屏幕的人，及其显示名。Core 保证同一时刻至多一路共享。
+struct ScreenSharePresenter: Equatable {
+    let userId: String
+    let displayName: String
+}
+
+extension UiSnapshot {
+    /// 共享期间主舞台让位给辅流。谁在共享完全由 Core 的 `screenShareUserIds` 决定，
+    /// UI 不做挑选，只负责把显示名补齐。
+    func screenSharePresenter() -> ScreenSharePresenter? {
+        guard let userId = screenShareUserIds.first else { return nil }
+        let name = members.first { $0.userId == userId }?.displayName
+        return ScreenSharePresenter(
+            userId: userId,
+            displayName: name?.isEmpty == false ? name! : userId
+        )
+    }
 }

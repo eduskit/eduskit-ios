@@ -21,10 +21,7 @@ public final class EduClassroomOptions: NSObject {
     @objc public let themeMode: EduThemeMode
     /// BCP 47，例如 zh-CN / en-US；nil 表示跟随系统。
     @objc public let localeTag: String?
-    /// DrawsKit 内置环境；whiteboardServerHost 非空时由私有/本地地址覆盖。
-    @objc public let whiteboardServerEnvironment: String
-    /// DrawsKit Room API 地址；本地 k8s / 生产均为 https://sdk.draw.eduskit.com。
-    @objc public let whiteboardServerHost: String?
+    @objc public let continuation: EduContinuationOptions?
 
     @objc public init(
         appId: String,
@@ -36,8 +33,7 @@ public final class EduClassroomOptions: NSObject {
         inviteDemoUserId: String = "student-demo",
         themeMode: EduThemeMode = .system,
         localeTag: String? = nil,
-        whiteboardServerEnvironment: String = WhiteboardServerDefaults.environment,
-        whiteboardServerHost: String? = nil
+        continuation: EduContinuationOptions? = nil
     ) {
         self.appId = appId
         self.backendUrl = backendUrl
@@ -48,7 +44,6 @@ public final class EduClassroomOptions: NSObject {
         self.inviteDemoUserId = inviteDemoUserId
         self.themeMode = themeMode
         self.localeTag = localeTag
-        self.whiteboardServerEnvironment = whiteboardServerEnvironment
-        self.whiteboardServerHost = whiteboardServerHost
+        self.continuation = continuation
     }
 }

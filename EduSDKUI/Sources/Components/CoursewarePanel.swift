@@ -3,7 +3,6 @@ import EduSDK
 
 private enum CoursewareUiDefaults {
     static let statusReady = "ready"
-    static let listMaxHeight: CGFloat = 360
     static let panelPadding: CGFloat = 20
 }
 
@@ -17,15 +16,16 @@ struct CoursewarePanelView: View {
     @State private var errorMessage: String?
 
     var body: some View {
+        CoursewarePanelViewport(preferredHeight: items.isEmpty ? 200 : 480) {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text(EduI18n.text("coursewarePanelTitle"))
                     .font(EduFont.sans(18, weight: .semibold))
                 Spacer()
                 Button(action: onDismiss) {
-                    EduIcon(EduIcons.close, size: 22, tint: EduColors.onSurfaceVariant)
+                    EduIcon(EduIcons.close, size: 22, tint: EduColors.onSurfaceVariant).frame(width: 44, height: 44)
                 }
-                .buttonStyle(EduPressButtonStyle())
+                .buttonStyle(EduPressButtonStyle()).accessibilityLabel(EduI18n.text("close"))
             }
 
             if let errorMessage, !errorMessage.isEmpty {
@@ -52,12 +52,11 @@ struct CoursewarePanelView: View {
                         }
                     }
                 }
-                .frame(maxHeight: CoursewareUiDefaults.listMaxHeight)
+                .frame(maxHeight: .infinity).clipped()
             }
         }
         .padding(CoursewareUiDefaults.panelPadding)
-        .eduGlass(cornerRadius: EduDimens.radius2xl, borderColor: EduColors.surfaceLow, tier: .soft)
-        .padding(40)
+        }
         .onAppear {
             controller.loadClassroomCourseware { items = $0 }
         }

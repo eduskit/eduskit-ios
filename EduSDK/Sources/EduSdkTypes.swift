@@ -15,43 +15,63 @@ public enum ClassroomLifecycleStatus: String, Codable {
     case expired
 }
 
+/// Native window IO only. Called on a worker; dispatch UI work asynchronously.
+/// Report strict ContinuationEvent JSON from any thread after actual OS completion.
+public protocol ContinuationWindowPort: AnyObject {
+    func dispatch(requestJson: String, report: @escaping (String) -> Void) throws
+}
+
 public struct EduSdkCreateOptions {
     public let appId: String
     public let backendUrl: String
-    public let environment: String?
     /// sdk-api Bearer；进课 join / IM 凭证拉取需要
     public let userToken: String?
     /// 集成方 App 版本，用于遥测区分「哪个 App 版本开始变差」
     public let appVersion: String?
     /// 遥测摄取根地址（log-ingest-svc），与 backendUrl 分离；join.ingestUrl 会覆盖
     public let telemetryUrl: String?
+    public let liveLicenseUrl: String?
+    public let liveLicenseKey: String?
+    public let continuationWindow: ContinuationWindowPort?
+    /// Worker-only initialization factory returning strict configure JSON, before joining.
+    public let continuation: (() throws -> String)?
+    public let continuationEnvironment: ContinuationEnvironmentSubscribe?
+    public let liveSupportsLeb: Bool
 
     public init(
         appId: String,
         backendUrl: String,
-        environment: String? = nil,
         userToken: String? = nil,
         appVersion: String? = nil,
-        telemetryUrl: String? = nil
+        telemetryUrl: String? = nil,
+        liveLicenseUrl: String? = nil,
+        liveLicenseKey: String? = nil,
+        liveSupportsLeb: Bool = true,
+        continuationWindow: ContinuationWindowPort? = nil,
+        continuation: (() throws -> String)? = nil,
+        continuationEnvironment: ContinuationEnvironmentSubscribe? = nil
     ) {
         self.appId = appId
         self.backendUrl = backendUrl
-        self.environment = environment
         self.userToken = userToken
         self.appVersion = appVersion
         self.telemetryUrl = telemetryUrl
+        self.liveLicenseUrl = liveLicenseUrl
+        self.liveLicenseKey = liveLicenseKey
+        self.continuationWindow = continuationWindow
+        self.continuation = continuation
+        self.continuationEnvironment = continuationEnvironment
+        self.liveSupportsLeb = liveSupportsLeb
     }
 }
 
 public struct InitializeConfig {
     public var appId: String?
     public var backendUrl: String?
-    public var environment: String?
 
-    public init(appId: String? = nil, backendUrl: String? = nil, environment: String? = nil) {
+    public init(appId: String? = nil, backendUrl: String? = nil) {
         self.appId = appId
         self.backendUrl = backendUrl
-        self.environment = environment
     }
 }
 
@@ -272,9 +292,26 @@ public struct ImMessage: Codable {
     }
 }
 
-public struct ImMessageListOptions {
+public struct ImHistoryError: Codable { public let code: Int32; public let message: String }
+public struct ImHistoryState: Codable {
+    public let loading: Bool
+    public let page: ImHistoryPage?
+    public let error: ImHistoryError?
+    public init(loading: Bool = false, page: ImHistoryPage? = nil, error: ImHistoryError? = nil) {
+        self.loading = loading; self.page = page; self.error = error
+    }
+}
+
+public struct ImHistoryPage: Codable {
+    public let messages: [ImMessage]
+    public let nextCursor: String?
+    public let hasMore: Bool
+}
+
+public struct ImHistoryOptions {
     public var cursor: String?
     public var limit: Int32?
+    public init(cursor: String? = nil, limit: Int32? = nil) { self.cursor = cursor; self.limit = limit }
 }
 
 public struct ClassInfo: Codable {
@@ -303,14 +340,81 @@ public enum ClassroomTimerMode: String, Codable {
 
 public struct ActionAvailability: Codable {
     public let action: String
+    /// 入口是否应出现在界面上；false 必须隐藏而不是置灰。
+    public let visible: Bool
     public let available: Bool
     public var reason: String?
+}
+
+/// 视频槽位。同一个用户可以同时有摄像头与屏幕共享两条轨道，
+/// 纯 userId 作键会让共享画面覆盖掉对方的摄像头绑定。
+public struct VideoSlot: Hashable {
+    private static let separator = "\u{0}"
+
+    public let userId: String
+    public let streamType: EduStreamType
+
+    public init(userId: String, streamType: EduStreamType) {
+        self.userId = userId
+        self.streamType = streamType
+    }
+
+    public init?(key: String) {
+        guard let range = key.range(of: Self.separator, options: .backwards),
+              let streamType = EduStreamType(rawValue: String(key[range.upperBound...]))
+        else { return nil }
+        self.userId = String(key[key.startIndex..<range.lowerBound])
+        self.streamType = streamType
+    }
+
+    public var key: String { "\(userId)\(Self.separator)\(streamType.rawValue)" }
+}
+
+/// 台下一路可播流。`url` 已由 Core 按本端能力挑好协议，宿主直接喂给播放器。
+public struct LiveStream: Equatable {
+    public let streamName: String
+    public let publisherUserId: String
+    /// `LiveStreamType` 的线值
+    public let streamType: String
+    public let url: String
+    /// 混音模式下视频路静音，声音走 audio 路
+    public let muted: Bool
+    public let expiresAt: String
+    /// 厂商已回报出画
+    public let playing: Bool
+
+    public init(
+        streamName: String,
+        publisherUserId: String,
+        streamType: String,
+        url: String,
+        muted: Bool,
+        expiresAt: String,
+        playing: Bool
+    ) {
+        self.streamName = streamName
+        self.publisherUserId = publisherUserId
+        self.streamType = streamType
+        self.url = url
+        self.muted = muted
+        self.expiresAt = expiresAt
+        self.playing = playing
+    }
+}
+
+/// 台下流的用途。主流一人一路占一格，辅流是屏幕共享，audio 是全场混音。
+public enum LiveStreamType: String {
+    case main
+    case aux
+    case audio
 }
 
 /// Atomic immutable projection published from the Core event queue. UI must subscribe instead of
 /// synchronously crossing the Core/FFI boundary from a render callback.
 public struct SdkSnapshot {
-    public let generation: UInt64
+    public internal(set) var continuation: ContinuationView?
+    public let classroomView: ClassroomView
+    public internal(set) var generation: UInt64
     public let classInfo: ClassInfo?
     public let onStageUsers: [StageUser]
     public let members: [ClassroomMember]
@@ -318,14 +422,25 @@ public struct SdkSnapshot {
     public let membersNextCursor: String?
     public let interactionPolicy: [ActionAvailability]
     public let imMessages: [ImMessage]
+    public let imHistoryState: ImHistoryState
     /// Core 判定的可绑远端视频用户；绑定路径只查表，不自行推导。
     public let bindableRemoteVideoUserIds: Set<String>
     /// Core 判定的本地预览是否可绑；不得自行对 localVideoMuted 取反。
     public let localVideoBindable: Bool
+    /// 本端是否正在推屏幕共享辅流；以 Vendor 采集回执为准。
+    public let localScreenSharing: Bool
+    /// Core 判定的可绑远端屏幕共享用户，语义同 `bindableRemoteVideoUserIds`。
+    public let bindableRemoteScreenUserIds: Set<String>
     /// 进行中且本人未上台：不进 RTC，改拉台上直播流。
     public let needLive: Bool
+    /// 台下该播哪几路；台上为空。一人一路主流，屏幕共享一路辅流，另加一路纯音频混流。
+    public let liveStreams: [LiveStream]
+    /// 与 `classroom.live_relay_changed` 对齐的集合版本，用于丢弃迟到下发。
+    public let liveRelayVersion: Int64
 
     public init(
+        continuation: ContinuationView? = nil,
+        classroomView: ClassroomView = .empty,
         generation: UInt64 = 0,
         classInfo: ClassInfo? = nil,
         onStageUsers: [StageUser] = [],
@@ -334,10 +449,17 @@ public struct SdkSnapshot {
         membersNextCursor: String? = nil,
         interactionPolicy: [ActionAvailability] = [],
         imMessages: [ImMessage] = [],
+        imHistoryState: ImHistoryState = ImHistoryState(),
         bindableRemoteVideoUserIds: Set<String> = [],
         localVideoBindable: Bool = false,
-        needLive: Bool = false
+        localScreenSharing: Bool = false,
+        bindableRemoteScreenUserIds: Set<String> = [],
+        needLive: Bool = false,
+        liveStreams: [LiveStream] = [],
+        liveRelayVersion: Int64 = 0
     ) {
+        self.continuation = continuation
+        self.classroomView = classroomView
         self.generation = generation
         self.classInfo = classInfo
         self.onStageUsers = onStageUsers
@@ -346,9 +468,14 @@ public struct SdkSnapshot {
         self.membersNextCursor = membersNextCursor
         self.interactionPolicy = interactionPolicy
         self.imMessages = imMessages
+        self.imHistoryState = imHistoryState
         self.bindableRemoteVideoUserIds = bindableRemoteVideoUserIds
         self.localVideoBindable = localVideoBindable
+        self.localScreenSharing = localScreenSharing
+        self.bindableRemoteScreenUserIds = bindableRemoteScreenUserIds
         self.needLive = needLive
+        self.liveStreams = liveStreams
+        self.liveRelayVersion = liveRelayVersion
     }
 }
 
@@ -530,25 +657,32 @@ public struct JoinProgress: Codable {
 
 /// Core 下发的白板凭证；`nil` 表示本次课堂不需要白板或白板已关闭。
 public struct WhiteboardCredentials: Codable {
+    public let mediaSessionId: String
     public let appId: String
     public let roomId: String
     public let userId: String
     public let token: String
+    /// 白板 sdk-api 根地址，来自 join `whiteboard.serverHost`，按部署环境下发。
+    public let serverHost: String
     public var role: String?
     public var expiresAt: String?
 
     public init(
+        mediaSessionId: String,
         appId: String,
         roomId: String,
         userId: String,
         token: String,
+        serverHost: String,
         role: String? = nil,
         expiresAt: String? = nil
     ) {
+        self.mediaSessionId = mediaSessionId
         self.appId = appId
         self.roomId = roomId
         self.userId = userId
         self.token = token
+        self.serverHost = serverHost
         self.role = role
         self.expiresAt = expiresAt
     }

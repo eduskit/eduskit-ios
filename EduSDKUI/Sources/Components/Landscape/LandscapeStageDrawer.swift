@@ -98,10 +98,6 @@ struct LandscapeStageDrawer: View {
                         .font(EduFont.sans(14, weight: .semibold))
                         .foregroundStyle(EduColors.onSurface)
                         .multilineTextAlignment(.center)
-                    Text(EduI18n.text("stageEmptyHint"))
-                        .font(EduFont.sans(Tokens.emptyHintFontSize))
-                        .foregroundStyle(EduColors.onSurfaceVariant)
-                        .multilineTextAlignment(.center)
                 }
                 .padding(.horizontal, Tokens.emptyHorizontalPadding)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -130,18 +126,12 @@ private struct StageTileView: View {
     let participant: ClassroomParticipant
     let width: CGFloat
     var showLiveBadge: Bool = false
+    @Environment(\.liveUiSnapshot) private var liveSnapshot
 
     private enum Tokens {
         static let cornerRadius: CGFloat = 10
     }
 
-    private var initials: String {
-        if let i = participant.initials, !i.isEmpty { return i }
-        return participant.displayName
-            .split(separator: " ").prefix(2)
-            .compactMap { $0.first.map(String.init) }
-            .joined()
-    }
 
     private var shortName: String {
         let first = participant.displayName.split(separator: " ").first.map(String.init) ?? participant.displayName
@@ -152,13 +142,26 @@ private struct StageTileView: View {
         ZStack {
             CenteredTileAvatar(
                 avatarUrl: participant.avatarUrl,
-                initials: initials,
-                size: EduDimens.tileAvatarSizeCompact,
-                fontSize: EduDimens.tileAvatarFontCompact
+                size: EduDimens.tileAvatarSizeCompact
             )
-            RtcVideoSlotView(userId: participant.id, cornerRadius: Tokens.cornerRadius)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .allowsHitTesting(false)
+            let liveName = liveSnapshot.flatMap { LiveStreams.byUser($0)[participant.id] }
+            let showCamera = showsParticipantCameraSurface(videoMuted: participant.videoMuted)
+            if let liveName, showsParticipantLiveSurface(liveStreamName: liveName) {
+                LiveVideoSlotView(streamName: liveName, cornerRadius: Tokens.cornerRadius)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .allowsHitTesting(false)
+                if !showCamera {
+                    EduColors.surfaceVariant.frame(maxWidth: .infinity, maxHeight: .infinity)
+                    CenteredTileAvatar(
+                        avatarUrl: participant.avatarUrl,
+                        size: EduDimens.tileAvatarSizeCompact
+                    )
+                }
+            } else if showCamera {
+                RtcVideoSlotView(userId: participant.id, cornerRadius: Tokens.cornerRadius)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .allowsHitTesting(false)
+            }
 
             VStack {
                 Spacer()

@@ -177,6 +177,33 @@ public struct LaserPatch {
 /// - Note: DrawsKit 回调可能来自非主线程；对 `@Published` 属性的写入统一 hop 回主线程。
 ///         联动规则集中在此文件维护；面板组件仅负责渲染 + 派发 patch。
 public final class WhiteboardHost: ObservableObject {
+    private var collaborationSuspended = false
+    /// SDK worker starts the capability; Main only selects the scoped UIView.
+    /// A stale queued stop cannot suspend a subsequently bound media scope.
+    func suspendCollaboration(mediaSessionId:String, completion:@escaping(Result<Void,Error>)->Void) {
+        DispatchQueue.main.async { [self] in
+            guard roomMediaSessionId == mediaSessionId || roomMediaBinding?.mediaSessionId == mediaSessionId else {
+                completion(.failure(SdkError(code:.whiteboardProviderError,message:"Whiteboard suspension scope changed")));return
+            }
+            collaborationSuspended = true
+            let board=sessionDrawsKit
+            board?.setDrawEnable(false)
+            let stopped:WhiteboardRoomMediaPump.Completion = { result in
+                switch result {
+                case .failure(let error):completion(.failure(error))
+                case .success:
+                    DispatchQueue.main.async {
+                        guard let board else{completion(.success(()));return}
+                        board.suspendCollaboration { completion(.success(())) }
+                    }
+                }
+            }
+            if let binding=roomMediaBinding {binding.close(stopped)}
+            else if let board {board.closeRoomMediaSession{stopped($0.map{_ in ()})}}
+            else {stopped(.success(()))}
+        }
+    }
+
     public static let shared = WhiteboardHost()
 
     /// 预热白板 FFI。不创建会话、不带 token 进房。可在后台队列调用；幂等。
@@ -195,6 +222,12 @@ public final class WhiteboardHost: ObservableObject {
     private var readyStarted = false
     /// join 下发的白板凭证；优先于画布默认 demo 参数。
     private var joinCredentials: WhiteboardConfig?
+    private weak var roomMediaSdk: EduSdk?
+    private var roomMediaSessionId: String?
+    private var roomMediaBinding: WhiteboardRoomMediaBinding?
+    @Published private var sessionRetiring=false
+    private var retirementInFlight=false
+    private var roomMediaFeedback: ((Error)->Void)?
     @Published public private(set) var localEditEnabled = false
     @Published public private(set) var localEditRestrictionReason: String?
     private var writeAuthorizer: (() -> Bool)?
@@ -276,7 +309,7 @@ public final class WhiteboardHost: ObservableObject {
             && sessionDrawsKit?.initParams.userId == config.userId
         joinCredentials = config
         hasJoinCredentials = true
-        if sameSession, let existing = sessionDrawsKit {
+        if sameSession, !sessionRetiring, let existing = sessionDrawsKit {
             do {
                 try existing.updateCredentials(config.token)
             } catch {
@@ -291,12 +324,25 @@ public final class WhiteboardHost: ObservableObject {
         }
     }
 
+    /// SDK scope, not the room/user pair, owns media requests. Same-scope token
+    /// renewal keeps the existing renderer/player instance and personal settings.
+    func bindRoomMediaSdk(_ sdk: EduSdk?, mediaSessionId: String?) {
+        precondition(Thread.isMainThread)
+        guard roomMediaSdk !== sdk || roomMediaSessionId != mediaSessionId else { return }
+        destroySessionEngine()
+        roomMediaSdk = sdk; roomMediaSessionId = mediaSessionId
+        syncBridge.bindMediaSession(mediaSessionId)
+    }
+
+    func bindRoomMediaFeedback(_ handler: ((Error)->Void)?) { roomMediaFeedback = handler }
+
     public func bindSyncSender(
         _ sender: ((String) throws -> Void)?,
         liveStrokeSender: ((String) throws -> Void)? = nil,
+        mediaSender: ((String) throws -> Void)? = nil,
         onFailure: ((Error) throws -> Void)? = nil
     ) {
-        syncBridge.bindSender(sender, liveStroke: liveStrokeSender, onFailure: onFailure)
+        syncBridge.bindSender(sender, liveStroke: liveStrokeSender, media: mediaSender, onFailure: onFailure)
     }
 
     /// 共享白板写操作必须在进入 DrawsKit 前通过 Core 交互策略裁决。
@@ -325,7 +371,7 @@ public final class WhiteboardHost: ObservableObject {
     public func setLocalEditEnabled(_ enabled: Bool, restrictionReason: String? = nil) {
         localEditEnabled = enabled
         localEditRestrictionReason = enabled ? nil : restrictionReason
-        (current ?? sessionDrawsKit)?.setDrawEnable(enabled)
+        (current ?? sessionDrawsKit)?.setDrawEnable(enabled && !sessionRetiring && !collaborationSuspended)
     }
 
     public func receiveWhiteboardSync(_ payloadJson: String) {
@@ -337,8 +383,20 @@ public final class WhiteboardHost: ObservableObject {
         syncBridge.receiveLiveStroke(payloadJson)
     }
 
+    /// 课件播放信令。Bridge 只收下本会话的 payload，再交给现有播放器。
+    public func receiveWhiteboardMedia(_ payloadJson: String) {
+        syncBridge.receiveMedia(payloadJson)
+    }
+
+    public func receiveMediaClock(_ payloadJson: String) {
+        // SDK clock callbacks are published on main. Select the current UI-owned
+        // instance now; it queues the original sample on its own engine worker.
+        precondition(Thread.isMainThread)
+        (current ?? sessionDrawsKit)?.setMediaClockObservation(payloadJson)
+    }
+
     private func withBackend(_ block: () -> Void) {
-        guard suppressBackend == 0 else { return }
+        guard suppressBackend == 0, !sessionRetiring, !collaborationSuspended else { return }
         block()
     }
 
@@ -358,7 +416,8 @@ public final class WhiteboardHost: ObservableObject {
 
     /// 取得或创建课堂会话 DrawsKit（同一 room/user 跨布局复用）。
     /// 无 join 凭证时返回 nil，禁止用 demo token 进房。
-    func acquireSession(config: WhiteboardConfig) -> DrawsKit? {
+    func acquireSession() -> DrawsKit? {
+        guard !sessionRetiring, !collaborationSuspended else{return nil}
         guard let effective = joinCredentials else { return nil }
         if let existing = sessionDrawsKit {
             if existing.initParams.roomId == effective.roomId,
@@ -366,18 +425,15 @@ public final class WhiteboardHost: ObservableObject {
                 return existing
             }
             destroySessionEngine()
+            return nil // Await the old owner before constructing a replacement.
         }
-        var drawsKitConfig: [String: Any] = [
-            WhiteboardServerDefaults.configKeyEnvironment: effective.serverEnvironment,
+        let drawsKitConfig: [String: Any] = [
+            WhiteboardServerDefaults.configKeyCustomServer: [
+                WhiteboardServerDefaults.configKeyServerHost: effective.serverHost,
+            ],
             "ratio": WhiteboardLayoutDefaults.ratio,
             "toolType": DrawsKit.ToolType.DRAWSKIT_TOOL_TYPE_PEN,
         ]
-        if let serverHost = effective.serverHost?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !serverHost.isEmpty {
-            drawsKitConfig[WhiteboardServerDefaults.configKeyCustomServer] = [
-                WhiteboardServerDefaults.configKeyServerHost: serverHost,
-            ]
-        }
         let drawsKit = DrawsKit(initParams: DrawsKitInitParams(
             id: effective.id,
             roomId: effective.roomId,
@@ -393,8 +449,8 @@ public final class WhiteboardHost: ObservableObject {
     }
 
     /// 取得会话级常驻 `DrawsKitView`（跨横竖屏布局复用同一 UIView）。
-    func acquireSurface(config: WhiteboardConfig) -> DrawsKitView? {
-        guard acquireSession(config: config) != nil else { return nil }
+    func acquireSurface() -> DrawsKitView? {
+        guard acquireSession() != nil else { return nil }
         if let surface = persistentSurface { return surface }
         let surface = DrawsKitView()
         persistentSurface = surface
@@ -402,9 +458,9 @@ public final class WhiteboardHost: ObservableObject {
     }
 
     /// 把常驻 surface 绑到当前 host 容器（首次 attach；之后同 view 只 relayout）。
-    func bindPersistentSurface(config: WhiteboardConfig, boardContainer: UIView) {
-        guard let drawsKit = acquireSession(config: config),
-              let surface = acquireSurface(config: config) else { return }
+    func bindPersistentSurface(boardContainer: UIView) {
+        guard let drawsKit = acquireSession(),
+              let surface = acquireSurface() else { return }
         drawsKit.attachView(surface, boardContainer: boardContainer)
         register(drawsKit)
         ensureSessionEvents(drawsKit)
@@ -419,7 +475,11 @@ public final class WhiteboardHost: ObservableObject {
                 NSLog("[WhiteboardHost] ready() returned false")
             }
             self.applyOnMain { host in
-                host.markEngineReady(ok, boardId: drawsKit.initParams.roomId)
+                guard host.sessionDrawsKit === drawsKit else { return }
+                if ok {
+                    host.markEngineReady(true, boardId: drawsKit.initParams.roomId, source: drawsKit)
+                    host.armCoursewareMediaSync(drawsKit)
+                } else { host.markEngineReady(false, boardId: drawsKit.initParams.roomId, source: drawsKit) }
             }
         }
     }
@@ -433,28 +493,66 @@ public final class WhiteboardHost: ObservableObject {
     /// 仅销毁引擎与 surface，保留 join 凭证（会话身份变更时重建用）。
     /// 可观察的引擎状态由会话入口先行重置，避免画布挂载期间同步发布 SwiftUI 状态。
     private func destroySessionEngine() {
-        guard let drawsKit = sessionDrawsKit else {
-            clearPersistentSurface()
-            readyStarted = false
-            sessionEventsBound = false
+        precondition(Thread.isMainThread)
+        guard !retirementInFlight else{return}
+        sessionGeneration &+= 1
+        engineReady=false
+        guard let drawsKit=sessionDrawsKit else {
+            roomMediaBinding=nil;sessionRetiring=false;collaborationSuspended=false
+            clearPersistentSurface();readyStarted=false;sessionEventsBound=false
             return
         }
-        sessionDrawsKit = nil
-        sessionEventsBound = false
-        readyStarted = false
-        clearPersistentSurface()
-        drawsKit.destroy()
-        unregister(drawsKit)
+        sessionRetiring=true;collaborationSuspended=true;retirementInFlight=true
+        drawsKit.setDrawEnable(false)
+        let binding=roomMediaBinding
+        let retired:WhiteboardRoomMediaPump.Completion = { [self,drawsKit,binding] result in
+            // Captures keep the old SDK/native owner alive through both receipts.
+            DispatchQueue.main.async { [self,drawsKit,binding] in
+                guard sessionDrawsKit === drawsKit else{return}
+                retirementInFlight=false
+                switch result {
+                case .failure(let error):
+                    engineFailed=true;roomMediaFeedback?(error)
+                    // Keep the old owner and deny replacement. A later explicit
+                    // destruction/suspension may retry its failed cleanup.
+                case .success:
+                    roomMediaBinding=nil;sessionDrawsKit=nil
+                    sessionEventsBound=false;readyStarted=false
+                    clearPersistentSurface();drawsKit.destroy();unregister(drawsKit)
+                    collaborationSuspended=false;sessionRetiring=false
+                }
+                _ = binding
+            }
+        }
+        let stopped:WhiteboardRoomMediaPump.Completion = { result in
+            switch result {
+            case .failure:retired(result)
+            case .success:
+                DispatchQueue.main.async {
+                    drawsKit.suspendCollaboration {retired(.success(()))}
+                }
+            }
+        }
+        if let binding {binding.close(stopped)}
+        else {drawsKit.closeRoomMediaSession{stopped($0.map{_ in ()})}}
     }
 
     func markEngineReady(
         _ ok: Bool,
         boardId: String? = nil,
         failureMessage: String? = nil,
-        report: Bool = true
+        report: Bool = true,
+        source: DrawsKit? = nil
     ) {
+        if let source, sessionDrawsKit !== source { return }
+        if sessionRetiring {return}
         engineReady = ok
         engineFailed = !ok
+        if ok && collaborationSuspended {
+            let retained = sessionDrawsKit
+            syncReloadQueue.async { retained?.suspendCollaboration() }
+            return
+        }
         if ok {
             if report, let boardId, boardId == joinCredentials?.roomId { readyHandler?(boardId) }
             drainPendingSyncReload()
@@ -491,28 +589,47 @@ public final class WhiteboardHost: ObservableObject {
         pendingRecoveryGeneration = 0
         pendingSyncReloadSeq = 0
         requestedSyncReloadSeq = max(requestedSyncReloadSeq, serverSeq)
-        let generation = sessionGeneration
-        syncReloadQueue.async { [weak self, weak drawsKit] in
-            guard let self, let drawsKit else { return }
-            drawsKit.syncAndReload()
-            self.applyOnMain { host in
-                guard host.sessionGeneration == generation else { return }
-                // 状态已在入队前推进；这里只用于丢弃旧会话完成回调。
-            }
+        drawsKit.syncAndReload()
+    }
+
+    func syncCoursewareMediaPublisher() {
+        guard let drawsKit = sessionDrawsKit else { return }
+        armCoursewareMediaSync(drawsKit)
+    }
+
+    private func armCoursewareMediaSync(_ drawsKit: DrawsKit) {
+        var allowed = false
+        if let sdk = roomMediaSdk, let policy = try? sdk.getClassroomInteractionPolicy() {
+            allowed = policy.contains { $0.action == "operate_courseware" && $0.available }
         }
+        drawsKit.setSyncAudioStatusEnable(allowed)
+        drawsKit.setSyncVideoStatusEnable(allowed)
+        drawsKit.showVideoControl(allowed)
+        drawsKit.enableAudioControl(allowed)
+        drawsKit.setShowPPTAudioControls(allowed)
+        if allowed { drawsKit.startSyncVideoStatus() } else { drawsKit.stopSyncVideoStatus() }
     }
 
     func updateJoinProgress(_ progress: JoinProgress) {
         joinProgress = progress
     }
 
+    /// A delayed SDK teardown must not clear a newly mounted classroom.
+    func endSession(ownedBy sdk:EduSdk) {
+        precondition(Thread.isMainThread)
+        guard roomMediaSdk === sdk else{return}
+        endSession()
+    }
+
     /// 离开课堂时销毁会话与常驻 surface，并清空 join 凭证。
     public func endSession() {
+        collaborationSuspended = false
         sessionGeneration &+= 1
         pendingRecoveryRoomId = nil
         pendingRecoveryGeneration = 0
         requestedRecoveryGeneration = 0
         joinCredentials = nil
+        roomMediaSdk = nil; roomMediaSessionId = nil
         hasJoinCredentials = false
         engineReady = false
         engineFailed = false
@@ -567,14 +684,17 @@ public final class WhiteboardHost: ObservableObject {
                 host.syncStyle(from: drawsKit)
             }
         }
-        drawsKit.on(DrawsKit.EVENT.DK_OPERATE_CANUNDO_STATUS_CHANGED) { payload in
-            host.applyHistory(canUndo: Self.boolFromPayload(payload), canRedo: nil)
+        drawsKit.on(DrawsKit.EVENT.DK_OPERATE_CANUNDO_STATUS_CHANGED) { [weak drawsKit] payload in
+            guard let drawsKit else { return }
+            host.applyHistory(from: drawsKit, canUndo: Self.boolFromPayload(payload), canRedo: nil)
         }
-        drawsKit.on(DrawsKit.EVENT.DK_OPERATE_CANREDO_STATUS_CHANGED) { payload in
-            host.applyHistory(canUndo: nil, canRedo: Self.boolFromPayload(payload))
+        drawsKit.on(DrawsKit.EVENT.DK_OPERATE_CANREDO_STATUS_CHANGED) { [weak drawsKit] payload in
+            guard let drawsKit else { return }
+            host.applyHistory(from: drawsKit, canUndo: nil, canRedo: Self.boolFromPayload(payload))
         }
-        drawsKit.on(DrawsKit.EVENT.DK_AUTH_EXPIRED) { _ in
-            host.authExpiredHandler?()
+        drawsKit.on(DrawsKit.EVENT.DK_AUTH_EXPIRED) { [weak drawsKit] _ in
+            guard let drawsKit else { return }
+            host.applyOnMain(from: drawsKit) { $0.authExpiredHandler?() }
         }
     }
 
@@ -597,6 +717,7 @@ public final class WhiteboardHost: ObservableObject {
         guard current === drawsKit else { return }
         current = nil
         applyOnMain { host in
+            guard host.current == nil, host.sessionDrawsKit == nil else { return }
             host.boardTotal = 1
             host.boardIndex = 1
             host.boardScalePercent = 100
@@ -667,7 +788,7 @@ public final class WhiteboardHost: ObservableObject {
                 selection: drawsKit.getSelectedElementIds()
             )
         }
-        applyOnMain { host in
+        applyOnMain(from: drawsKit) { host in
             host.applyBoards(snapshot.boards)
             host.applyCourseware(snapshot.courseware)
             host.boardScalePercent = snapshot.scalePercent
@@ -680,7 +801,7 @@ public final class WhiteboardHost: ObservableObject {
     func syncBoards(from drawsKit: DrawsKit) {
         let boards = readBoards(from: drawsKit)
         let courseware = readCourseware(from: drawsKit)
-        applyOnMain { host in
+        applyOnMain(from: drawsKit) { host in
             host.applyBoards(boards)
             host.applyCourseware(courseware)
         }
@@ -688,7 +809,7 @@ public final class WhiteboardHost: ObservableObject {
 
     func syncCourseware(from drawsKit: DrawsKit) {
         let courseware = readCourseware(from: drawsKit)
-        applyOnMain { host in host.applyCourseware(courseware) }
+        applyOnMain(from: drawsKit) { host in host.applyCourseware(courseware) }
     }
 
     private func readBoards(from drawsKit: DrawsKit) -> BoardsSnapshot {
@@ -748,8 +869,9 @@ public final class WhiteboardHost: ObservableObject {
         coursewareLoadMessage = ""
     }
 
-    private func setCoursewareLoading(_ loading: Bool, message: String = "") {
+    private func setCoursewareLoading(_ loading: Bool, message: String = "", source: DrawsKit? = nil) {
         applyOnMain { host in
+            if let source, host.sessionDrawsKit !== source { return }
             host.coursewareLoading = loading
             host.coursewareLoadMessage = message
         }
@@ -774,9 +896,9 @@ public final class WhiteboardHost: ObservableObject {
         switch status {
         case CoursewareLoadStatus.loading:
             guard isVisiblePage else { return }
-            setCoursewareLoading(true, message: CoursewareLoadingStrings.default)
+            setCoursewareLoading(true, message: CoursewareLoadingStrings.default, source: drawsKit)
         case CoursewareLoadStatus.ready:
-            setCoursewareLoading(false)
+            setCoursewareLoading(false, source: drawsKit)
         case CoursewareLoadStatus.error:
             let reason: String
             if let r = obj["reason"] as? String, !r.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -785,7 +907,7 @@ public final class WhiteboardHost: ObservableObject {
                 reason = CoursewareLoadingStrings.errorFallback
             }
             NSLog("[WhiteboardHost] courseware page error: %@", reason)
-            setCoursewareLoading(false, message: reason)
+            setCoursewareLoading(false, message: reason, source: drawsKit)
         default:
             break
         }
@@ -808,7 +930,7 @@ public final class WhiteboardHost: ObservableObject {
 
     func syncScale(from drawsKit: DrawsKit) {
         let clamped = readScale(from: drawsKit)
-        applyOnMain { host in host.boardScalePercent = clamped }
+        applyOnMain(from: drawsKit) { host in host.boardScalePercent = clamped }
     }
 
     private func readScale(from drawsKit: DrawsKit) -> Int {
@@ -817,7 +939,7 @@ public final class WhiteboardHost: ObservableObject {
 
     func syncTool(from drawsKit: DrawsKit) {
         let tool = readTool(from: drawsKit)
-        applyOnMain { host in host.applyTool(tool) }
+        applyOnMain(from: drawsKit) { host in host.applyTool(tool) }
     }
 
     private func readTool(from drawsKit: DrawsKit) -> ToolSnapshot {
@@ -832,7 +954,7 @@ public final class WhiteboardHost: ObservableObject {
 
     func syncStyle(from drawsKit: DrawsKit) {
         let style = readStyle(from: drawsKit)
-        applyOnMain { host in host.applyStyle(style) }
+        applyOnMain(from: drawsKit) { host in host.applyStyle(style) }
     }
 
     private func applyStyle(_ style: StyleSnapshot) {
@@ -897,11 +1019,11 @@ public final class WhiteboardHost: ObservableObject {
 
     func syncSelection(from drawsKit: DrawsKit) {
         let ids = drawsKit.getSelectedElementIds()
-        applyOnMain { host in host.selection = ids }
+        applyOnMain(from: drawsKit) { host in host.selection = ids }
     }
 
-    func applyHistory(canUndo: Bool?, canRedo: Bool?) {
-        applyOnMain { host in
+    func applyHistory(from source: DrawsKit, canUndo: Bool?, canRedo: Bool?) {
+        applyOnMain(from: source) { host in
             host.history = HistoryStatus(
                 canUndo: canUndo ?? host.history.canUndo,
                 canRedo: canRedo ?? host.history.canRedo
@@ -1104,25 +1226,31 @@ public final class WhiteboardHost: ObservableObject {
     }
 
     public func deleteSelected() {
-        // DrawsKit iOS 尚未暴露 deleteElements 公共接口，暂用 no-op（等 SDK 补齐）。
+        withBackend {
+            guard let dk = current else { return }
+            dk.removeElementsByIds(dk.getSelectedElementIds())
+        }
     }
 
     public func lockSelected(_ lock: Bool) {
         withBackend {
             guard let dk = current else { return }
-            let ids = dk.getSelectedElementIds()
-            if !ids.isEmpty {
-                dk.lockElements(ids.joined(separator: ","), lock)
-            }
+            dk.lockElements(dk.getSelectedElementIds(), lock)
         }
     }
 
     public func bringSelectedToFront() {
-        // DrawsKit iOS 尚未暴露 bringToFront，暂 no-op。
+        withBackend {
+            guard let dk = current else { return }
+            dk.bringElementsToFront(dk.getSelectedElementIds())
+        }
     }
 
     public func sendSelectedToBack() {
-        // DrawsKit iOS 尚未暴露 sendToBack，暂 no-op。
+        withBackend {
+            guard let dk = current else { return }
+            dk.sendElementsToBack(dk.getSelectedElementIds())
+        }
     }
 
     // MARK: - Board / zoom
@@ -1159,13 +1287,13 @@ public final class WhiteboardHost: ObservableObject {
 
     /// 转码 manifest（Dictionary / JSON 字符串）→ 加载课件
     @discardableResult
-    public func addTranscodeFile(_ manifest: Any) -> String? {
-        let fileId = current?.addTranscodeFile(manifest)
-        if let dk = current, let fileId, !fileId.isEmpty {
-            // 事件未到前先给反馈，避免白屏
-            setCoursewareLoading(true, message: CoursewareLoadingStrings.default)
-            withBackendSuppressed { syncCourseware(from: dk) }
-        }
+    @MainActor
+    public func addTranscodeFile(_ manifest: Any) async throws -> String {
+        guard let dk = current else { throw CancellationError() }
+        let fileId = try await dk.addTranscodeFile(manifest)
+        guard current === dk else { throw CancellationError() }
+        setCoursewareLoading(true, message: CoursewareLoadingStrings.default)
+        withBackendSuppressed { syncCourseware(from: dk) }
         return fileId
     }
 
@@ -1311,6 +1439,13 @@ public final class WhiteboardHost: ObservableObject {
     /// 对 `@Published` 的写入一律异步 hop 到主队列。
     /// 若已在主线程则同步执行，会在 SwiftUI body / GeometryReader / Preference
     /// 更新期间触发 “Publishing changes from within view updates”。
+    private func applyOnMain(from source: DrawsKit, _ block: @escaping (WhiteboardHost) -> Void) {
+        applyOnMain { host in
+            guard host.sessionDrawsKit === source else { return }
+            block(host)
+        }
+    }
+
     private func applyOnMain(_ block: @escaping (WhiteboardHost) -> Void) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }

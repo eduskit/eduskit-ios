@@ -9,6 +9,8 @@ public final class EduClassroomViewController: UIViewController {
     private var controller: ClassroomController!
     private var hostingController: UIHostingController<EduClassroomApp>?
     private let orientationController = OrientationController()
+    private var explicitLeave = false
+    private var classroomScene: UIWindowScene?
 
     @objc public init(options: EduClassroomOptions) {
         self.options = options
@@ -30,8 +32,22 @@ public final class EduClassroomViewController: UIViewController {
         navigationController?.view.backgroundColor = chromeBackground
         navigationController?.setNavigationBarHidden(true, animated: false)
 
-        let classroomController = ClassroomController(options: options)
+        let retained = ClassroomSessionRetention.take(matching: options)
+        let classroomController = retained ?? ClassroomController(options: options)
         self.controller = classroomController
+        if #available(iOS 15.0, *) {
+            let port = IosContinuationWindowPort(
+                sourceView: { [weak self] in self?.view },
+                attachContent: { [weak classroomController] content, host in
+                    classroomController?.attachContinuationContent(content, to: host) ?? false
+                },
+                onContentReleased: { [weak classroomController] in
+                    classroomController?.releaseContinuationContent()
+                }
+            )
+            classroomController.bindContinuationWindow(port, stop: { [weak port] in port?.presentationDestroyed() })
+        }
+        isModalInPresentation = options.continuation != nil
 
         // Reflect landscape lock changes into UIKit orientation machinery.
         orientationController.onModeChange = { [weak self] mode in
@@ -45,6 +61,10 @@ public final class EduClassroomViewController: UIViewController {
             themeMode: options.themeMode,
             localeTag: options.localeTag
         ) { [weak self] in
+            self?.explicitLeave = true
+            self?.dismiss(animated: true)
+        } onKeepListening: { [weak self] in
+            self?.explicitLeave = false
             self?.dismiss(animated: true)
         }
         let host = UIHostingController(rootView: root)
@@ -60,7 +80,7 @@ public final class EduClassroomViewController: UIViewController {
             host.view.bottomAnchor.constraint(equalTo: view.bottomAnchor),
         ])
         host.didMove(toParent: self)
-        classroomController.initialize()
+        if retained == nil { classroomController.initialize() }
     }
 
     public override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
@@ -81,24 +101,38 @@ public final class EduClassroomViewController: UIViewController {
 
     public override var childForHomeIndicatorAutoHidden: UIViewController? { nil }
 
+    public override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        let scene = view.window?.windowScene
+        controller?.classroomPresentation(visible: true, scene: scene)
+        classroomScene = scene
+        ContinuationReturnEntry.shared.hide()
+    }
+
     public override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
+        controller?.classroomPresentation(visible: false, scene: view.window?.windowScene)
         if isBeingDismissed || navigationController?.isBeingDismissed == true {
-            // Release orientation lock on the way out so the host app resumes normal behaviour.
             orientationController.setMode(.auto)
             applyOrientation(.auto)
-            controller?.destroy()
+            if explicitLeave {
+                ContinuationReturnEntry.shared.hide()
+                controller?.destroy()
+            } else if let controller {
+                ClassroomSessionRetention.keep(controller)
+                let continuation = controller.snapshot.continuation
+                if continuation?.returnEntry == true && continuation?.playbackAllowed == true {
+                    ContinuationReturnEntry.shared.show(scene: classroomScene, options: options)
+                }
+            }
         }
     }
 
     private func applyOrientation(_ mode: OrientationMode) {
         if #available(iOS 16.0, *) {
             setNeedsUpdateOfSupportedInterfaceOrientations()
-            let scene = view.window?.windowScene ?? UIApplication.shared.connectedScenes
-                .compactMap { $0 as? UIWindowScene }
-                .first(where: { $0.activationState == .foregroundActive })
             let prefs = UIWindowScene.GeometryPreferences.iOS(interfaceOrientations: mode.geometryMask)
-            scene?.requestGeometryUpdate(prefs) { _ in }
+            view.window?.windowScene?.requestGeometryUpdate(prefs) { _ in }
         } else {
             let value: Int
             switch mode {
@@ -111,6 +145,22 @@ public final class EduClassroomViewController: UIViewController {
             }
             UIViewController.attemptRotationToDeviceOrientation()
         }
+    }
+}
+
+/// Process-owned classroom. Dismissing the view keeps this controller until an explicit leave.
+enum ClassroomSessionRetention {
+    private static var held: ClassroomController?
+
+    static func keep(_ controller: ClassroomController) { held = controller }
+
+    static func take(matching options: EduClassroomOptions) -> ClassroomController? {
+        guard let held,
+              held.options.appId == options.appId,
+              held.options.userId == options.userId,
+              held.options.classroomId == options.classroomId else { return nil }
+        self.held = nil
+        return held
     }
 }
 

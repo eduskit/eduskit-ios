@@ -8,6 +8,7 @@ public struct EduClassroomApp: View {
     var themeMode: EduThemeMode
     var localeTag: String?
     var onLeaveFinished: () -> Void
+    var onKeepListening: () -> Void
 
     @State private var document = DemoData.document
     @State private var videoLayout: VideoLayout = .rightTop
@@ -19,79 +20,9 @@ public struct EduClassroomApp: View {
     @State private var settingsOpen = false
     @State private var videoWallOpen = false
     @State private var contentFullscreen = false
-    /// 成员映射结果缓存。放在 `body` 里算会让每一帧（含动画帧）重跑一遍
-    /// 建 Set + 映射 + 过滤，这里改为随快照变化重算一次。
-    @State private var participants: [ClassroomParticipant] = []
-    @State private var stageParticipants: [ClassroomParticipant] = []
-    @State private var stripParticipants: [ClassroomParticipant] = []
-    @State private var featuredTeacher: ClassroomParticipant?
+    private var stripParticipants: [ClassroomParticipant] { controller.snapshot.stageParticipants }
+    private var featuredTeacher: ClassroomParticipant? { controller.snapshot.featuredTeacher }
     @Namespace private var tileNamespace
-
-    private enum Tokens {
-        /// 后台 `member.stageStatus` 的「台上」取值。
-        static let stageStatusOn = "on"
-    }
-
-    private static func buildParticipants(
-        members: [ClassroomMember],
-        onStage: [StageUser],
-        streamInfos: [StreamInfo]
-    ) -> [ClassroomParticipant] {
-        let stageIds = Set(onStage.map(\.userId))
-        func muteOf(_ userId: String) -> (Bool, Bool) {
-            let stream = streamInfos.first { $0.userId == userId }
-            return (stream?.audioMuted ?? true, stream?.videoMuted ?? true)
-        }
-        var result = members.map { member in
-            let mute = muteOf(member.userId)
-            return ClassroomParticipant(
-                id: member.userId,
-                displayName: member.displayName?.isEmpty == false ? member.displayName! : member.userId,
-                roleLabel: member.role,
-                avatarUrl: member.avatarUrl,
-                initials: nil,
-                onStage: member.stageStatus == Tokens.stageStatusOn || stageIds.contains(member.userId),
-                audioMuted: mute.0,
-                videoMuted: mute.1
-            )
-        }
-        let mappedIds = Set(result.map(\.id))
-        for user in onStage where !mappedIds.contains(user.userId) {
-            let mute = muteOf(user.userId)
-            result.append(ClassroomParticipant(
-                id: user.userId,
-                displayName: user.displayName?.isEmpty == false ? user.displayName! : user.userId,
-                roleLabel: nil,
-                avatarUrl: nil,
-                initials: nil,
-                onStage: true,
-                audioMuted: mute.0,
-                videoMuted: mute.1
-            ))
-        }
-        return result
-    }
-
-    private func refreshParticipants(from snapshot: UiSnapshot) {
-        let next = Self.buildParticipants(
-            members: snapshot.members,
-            onStage: snapshot.onStage,
-            streamInfos: snapshot.streamInfos
-        )
-        let nextStage = next.filter(\.onStage)
-        let nextTeacher = snapshot.featuredTeacherParticipant()
-        let nextStrip = snapshot.isTeacherVideoMainStage()
-            ? stripParticipantsExcludingTeacher(nextStage, teacherUserId: snapshot.teacherUserId)
-            : nextStage
-        guard next != participants
-            || nextStage != stageParticipants
-            || nextTeacher != featuredTeacher
-            || nextStrip != stripParticipants else { return }
-        participants = next
-        stageParticipants = nextStage
-        featuredTeacher = nextTeacher
-        stripParticipants = nextStrip
-    }
 
     private var flipDuration: Double { EduMotion.flipMin + 0.08 }
 
@@ -115,13 +46,15 @@ public struct EduClassroomApp: View {
         orientation: OrientationController = OrientationController(),
         themeMode: EduThemeMode = .system,
         localeTag: String? = nil,
-        onLeaveFinished: @escaping () -> Void
+        onLeaveFinished: @escaping () -> Void,
+        onKeepListening: @escaping () -> Void = {}
     ) {
         self.controller = controller
         self.orientation = orientation
         self.themeMode = themeMode
         self.localeTag = localeTag
         self.onLeaveFinished = onLeaveFinished
+        self.onKeepListening = onKeepListening
     }
 
     public var body: some View {
@@ -130,46 +63,8 @@ public struct EduClassroomApp: View {
             let isPhone = geo.size.width < EduDimens.phoneBreakpoint
             ZStack {
                 Group {
-                if isLandscape {
-                    LandscapeClassroomLayout(
-                        snapshot: controller.snapshot,
-                        title: classroomTitle,
-                        elapsedLabel: classroomTimerLabel,
-                        document: $document,
-                        members: controller.snapshot.members,
-                        stageParticipants: stripParticipants,
-                        videoLayout: videoLayout,
-                        videoWallOpen: videoWallOpen,
-                        orientation: orientation,
-                        onOpenSettings: { withAnimation(modalAnim) { settingsOpen = true } },
-                        onOpenThumbnails: { withAnimation(modalAnim) { thumbnailsOpen = true } },
-                        onFullscreen: { withAnimation(modalAnim) { contentFullscreen = true } },
-                        onVideoLayout: { setLayout($0, isPhone: true) },
-                        onToggleVideoWall: {
-                            withAnimation(modalAnim) { videoWallOpen.toggle() }
-                        },
-                        onEnd: endOrLeave,
-                        onBack: leave,
-                        onSendMessage: controller.sendImMessage,
-                        onRefreshMembers: controller.refreshMembers,
-                        onLoadMoreMembers: controller.loadMoreMembers,
-                        onLoadMemberActions: { userId, completion in
-                            controller.loadMemberActions(userId: userId, completion: completion)
-                        },
-                        onMemberAction: { action, userId, completion in
-                            controller.performMemberAction(action: action, userId: userId, completion: completion)
-                        },
-                        coursewareOpen: coursewareOpen,
-                        onToggleCourseware: {
-                            withAnimation(modalAnim) { coursewareOpen.toggle() }
-                        },
-                        onRequestInteraction: { _ = controller.requestInteraction($0) },
-                        onToggleMicrophone: { controller.setMicrophoneEnabled(controller.snapshot.audioMuted) },
-                        onToggleCamera: { controller.setCameraEnabled(controller.snapshot.videoMuted) },
-                        featuredTeacher: featuredTeacher
-                    )
-                } else if isPhone {
                     MobileClassroomLayout(
+                        toolsPanel: { AnyView(TeachingToolsPanel(controller: controller, portrait: true, onNotice: portraitNotice)) },
                         snapshot: controller.snapshot,
                         title: classroomTitle,
                         elapsedLabel: classroomTimerLabel,
@@ -179,6 +74,8 @@ public struct EduClassroomApp: View {
                         videoLayout: videoLayout,
                         videoWallOpen: videoWallOpen,
                         onOpenSettings: { withAnimation(modalAnim) { settingsOpen = true } },
+                        onNotifications: { portraitNotice(EduI18n.text("portraitToastNotifications")) },
+                        onNotice: portraitNotice,
                         onOpenThumbnails: { withAnimation(modalAnim) { thumbnailsOpen = true } },
                         onFullscreen: { withAnimation(modalAnim) { contentFullscreen = true } },
                         onVideoLayout: { setLayout($0, isPhone: true) },
@@ -202,49 +99,24 @@ public struct EduClassroomApp: View {
                         onRequestInteraction: { _ = controller.requestInteraction($0) },
                         onToggleMicrophone: { controller.setMicrophoneEnabled(controller.snapshot.audioMuted) },
                         onToggleCamera: { controller.setCameraEnabled(controller.snapshot.videoMuted) },
-                        featuredTeacher: featuredTeacher
-                    )
-                } else {
-                    // Desktop 仍走系统 Safe Area（顶/底/侧），与手机沉浸策略区分。
-                    DesktopClassroomLayout(
-                        snapshot: controller.snapshot,
-                        title: classroomTitle,
-                        elapsedLabel: classroomTimerLabel,
-                        document: document,
-                        participants: participants,
-                        stageParticipants: stripParticipants,
-                        videoLayout: videoLayout,
-                        videoWallOpen: videoWallOpen,
-                        sidebarCollapsed: $sidebarCollapsed,
-                        sidebarInstant: sidebarInstant,
-                        layoutFlipping: layoutFlipping,
-                        namespace: tileNamespace,
-                        onOpenSettings: { withAnimation(modalAnim) { settingsOpen = true } },
-                        onOpenThumbnails: { withAnimation(modalAnim) { thumbnailsOpen = true } },
-                        onZoomIn: { document.zoomPercent = min(200, document.zoomPercent + 10) },
-                        onZoomOut: { document.zoomPercent = max(50, document.zoomPercent - 10) },
-                        onFullscreen: { withAnimation(modalAnim) { contentFullscreen = true } },
-                        onVideoLayout: { setLayout($0, isPhone: false) },
-                        onToggleVideoWall: {
-                            withAnimation(modalAnim) { videoWallOpen.toggle() }
+                        onToggleHand: {
+                            if controller.snapshot.onStage.contains(where: { $0.userId == controller.snapshot.userId }) {
+                                controller.leaveStage()
+                            } else if controller.snapshot.handRaised {
+                                controller.cancelHand()
+                            } else {
+                                controller.raiseHand()
+                            }
                         },
-                        coursewareOpen: coursewareOpen,
-                        onToggleCourseware: {
-                            withAnimation(modalAnim) { coursewareOpen.toggle() }
+                        onToggleScreenShare: {
+                            if controller.snapshot.localScreenSharing { controller.stopScreenShare() }
+                            else { controller.startScreenShare() }
                         },
-                        onRequestInteraction: { _ = controller.requestInteraction($0) },
-                        onToggleMicrophone: { controller.setMicrophoneEnabled(controller.snapshot.audioMuted) },
-                        onToggleCamera: { controller.setCameraEnabled(controller.snapshot.videoMuted) },
                         featuredTeacher: featuredTeacher,
-                        onEnd: endOrLeave,
-                        onSendMessage: controller.sendImMessage,
-                        onLoadMoreMembers: controller.loadMoreMembers
+                        landscape: isLandscape,
+                        onOpenDevices: controller.openDeviceCheck,
+                        onStartClass: controller.startClass
                     )
-                    .padding(.top, geo.safeAreaInsets.top)
-                    .padding(.bottom, geo.safeAreaInsets.bottom)
-                    .padding(.leading, geo.safeAreaInsets.leading)
-                    .padding(.trailing, geo.safeAreaInsets.trailing)
-                }
 
                 if contentFullscreen && !controller.snapshot.isTeacherVideoMainStage() {
                     ContentCanvasView(
@@ -278,17 +150,19 @@ public struct EduClassroomApp: View {
                     .zIndex(10)
                 }
 
-                ModalScrimHost(visible: thumbnailsOpen, onDismiss: {
+                PopupShell(visible: thumbnailsOpen, onDismiss: {
                     withAnimation(modalAnim) { thumbnailsOpen = false }
-                }) {
+                }, alignBottom: isPhone) {
                     ThumbnailPopoverView(
-                        onDismiss: { withAnimation(modalAnim) { thumbnailsOpen = false } }
+                        onDismiss: { withAnimation(modalAnim) { thumbnailsOpen = false } },
+                        sheet: isPhone,
+                        onNotice: portraitNotice
                     )
                 }
                 .zIndex(11)
 
                 if !controller.snapshot.isTeacherVideoMainStage() {
-                    ModalScrimHost(visible: coursewareOpen, onDismiss: {
+                    PopupShell(visible: coursewareOpen, onDismiss: {
                         withAnimation(modalAnim) { coursewareOpen = false }
                     }) {
                         CoursewarePanelView(
@@ -299,10 +173,10 @@ public struct EduClassroomApp: View {
                     .zIndex(11)
                 }
 
-                ModalScrimHost(visible: settingsOpen, onDismiss: {
+                PopupShell(visible: settingsOpen, onDismiss: {
                     withAnimation(modalAnim) { settingsOpen = false }
                 }) {
-                    SettingsModalView(onDismiss: {
+                    SettingsModalView(controller: controller, onDismiss: {
                         withAnimation(modalAnim) { settingsOpen = false }
                     }, onCheckDevices: {
                         withAnimation(modalAnim) { settingsOpen = false }
@@ -311,9 +185,9 @@ public struct EduClassroomApp: View {
                 }
                 .zIndex(12)
 
-                ModalScrimHost(visible: controller.snapshot.deviceCheckOpen, onDismiss: {
+                PopupShell(visible: controller.snapshot.deviceCheckOpen, onDismiss: {
                     controller.closeDeviceCheck()
-                }) {
+                }, alignBottom: isPhone || isLandscape) {
                     DeviceCheckModalView(controller: controller)
                 }
                 .zIndex(13)
@@ -326,16 +200,16 @@ public struct EduClassroomApp: View {
             .overlay {
                 FeedbackHost(
                     feedback: controller.snapshot.feedback,
-                    onDismiss: controller.dismissFeedback,
+                    onShown: controller.feedbackShown,
+                    onDismiss: { id, reason in controller.dismissFeedback(id: id, reason: reason) },
                     onAction: controller.handleFeedbackAction
                 )
             }
+            .eduTooltips()
             .onAppear {
                 EduFontRegistrar.registerIfNeeded()
-                refreshParticipants(from: controller.snapshot)
             }
             .onReceive(controller.$snapshot) { snapshot in
-                refreshParticipants(from: snapshot)
                 if snapshot.isTeacherVideoMainStage() {
                     coursewareOpen = false
                     contentFullscreen = false
@@ -343,15 +217,26 @@ public struct EduClassroomApp: View {
             }
         }
         // 根容器全屏 bleed，子布局用 safeAreaInsets 自行处理顶/底/刘海。
-        .ignoresSafeArea()
+        .ignoresSafeArea(.container)
         .preferredColorScheme(preferredColorScheme)
+        .environment(\.chatHistoryControls, ChatHistoryControls(loading: controller.snapshot.historyLoading,
+            hasMore: controller.snapshot.historyHasMore, error: controller.snapshot.historyError, load: controller.loadImMessageHistory,
+            ready: controller.snapshot.initStatus == .ready,
+            notice: controller.snapshot.classroomView.runtime.historyNotice))
         .environment(\.locale, Locale(identifier: localeTag ?? Locale.current.identifier))
+        .environment(\.liveUiSnapshot, controller.snapshot)
         .environment(\.classroomVideoBinder, ClassroomVideoBinder(
-            bindUserVideo: { userId, view in
-                controller.bindUserVideo(userId: userId, view: view)
+            bindUserVideo: { slot, view in
+                controller.bindUserVideo(slot: slot, view: view)
             },
-            unbindUserVideo: { userId, view in
-                controller.unbindUserVideo(userId: userId, view: view)
+            unbindUserVideo: { slot, view in
+                controller.unbindUserVideo(slot: slot, view: view)
+            },
+            bindLiveStream: { streamName, view in
+                controller.bindLiveStream(streamName: streamName, view: view)
+            },
+            unbindLiveStream: { streamName, view in
+                controller.unbindLiveStream(streamName: streamName, view: view)
             }
         ))
     }
@@ -387,10 +272,18 @@ public struct EduClassroomApp: View {
         case .lockedPortrait:
             return false
         case .auto:
-            let compactHeight = geo.size.height < 500
-            let wider = geo.size.width > geo.size.height
-            return compactHeight && wider
+            let size = EduSafeArea.windowSize ?? geo.size
+            return size.width > size.height
         }
+    }
+
+    private func portraitNotice(_ message: String) {
+        controller.presentFeedback(FeedbackRequest.create(
+            mode: .toast,
+            tone: .info,
+            message: message,
+            autoDismissMs: 3000
+        ))
     }
 
     private func setLayout(_ next: VideoLayout, isPhone: Bool) {
@@ -424,6 +317,13 @@ public struct EduClassroomApp: View {
     }
 
     private func leave() {
+        if controller.snapshot.continuation != nil {
+            controller.promptClassroomBack(onContinue: onKeepListening, onLeave: {
+                controller.leaveClassroom()
+                onLeaveFinished()
+            })
+            return
+        }
         controller.leaveClassroom()
         onLeaveFinished()
     }

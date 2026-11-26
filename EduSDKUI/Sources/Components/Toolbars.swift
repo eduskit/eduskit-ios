@@ -146,7 +146,11 @@ struct FloatingToolbarView: View {
     var videoMuted: Bool = true
     var onToggleMicrophone: () -> Void = {}
     var onToggleCamera: () -> Void = {}
-    var permissionDeniedActions: Set<String> = []
+    var toolbarEntries: [String: ToolbarEntry] = [:]
+    var handRaised: Bool = false
+    var localScreenSharing: Bool = false
+    var onToggleHand: () -> Void = {}
+    var onToggleScreenShare: () -> Void = {}
     var showCourseware: Bool = true
     var canEndClass: Bool = false
     var onEnd: () -> Void
@@ -154,8 +158,12 @@ struct FloatingToolbarView: View {
     @State private var expanded = false
     private var micOn: Bool { !audioMuted }
     private var camOn: Bool { !videoMuted }
-    private let handUp = false
-    private let sharing = false
+    // 可见性与可用性全部来自 Core 的 interaction_policy。
+    private var mic: ToolbarEntry { toolbarEntries.entry("use_microphone") }
+    private var camera: ToolbarEntry { toolbarEntries.entry("use_camera") }
+    private var raiseHand: ToolbarEntry { toolbarEntries.entry("raise_hand") }
+    private var share: ToolbarEntry { toolbarEntries.entry("share_screen") }
+    private var courseware: ToolbarEntry { toolbarEntries.entry("operate_courseware") }
     @State private var layoutOpen = false
 
     var body: some View {
@@ -191,25 +199,34 @@ struct FloatingToolbarView: View {
                             if !expanded { layoutOpen = false }
                         }
                     }
-                    CtrlBtnView(icon: micOn ? EduIcons.mic : EduIcons.micOff, label: permissionLabel(EduI18n.text("controlMic"), "use_microphone"), off: !micOn, enabled: !permissionDeniedActions.contains("use_microphone")) {
-                        onToggleMicrophone()
+                    if mic.visible {
+                        CtrlBtnView(icon: micOn ? EduIcons.mic : EduIcons.micOff, label: restrictedLabel(EduI18n.text("controlMic"), mic), off: !micOn, enabled: !mic.disabled) {
+                            onToggleMicrophone()
+                        }
                     }
-                    CtrlBtnView(icon: camOn ? EduIcons.videocam : EduIcons.videocamOff, label: permissionLabel(EduI18n.text("controlCamera"), "use_camera"), off: !camOn, enabled: !permissionDeniedActions.contains("use_camera")) {
-                        onToggleCamera()
+                    if camera.visible {
+                        CtrlBtnView(icon: camOn ? EduIcons.videocam : EduIcons.videocamOff, label: restrictedLabel(EduI18n.text("controlCamera"), camera), off: !camOn, enabled: !camera.disabled) {
+                            onToggleCamera()
+                        }
                     }
 
                     HStack(spacing: EduDimens.stackSm) {
-                        CtrlBtnView(icon: EduIcons.frontHand, label: "Hand", active: handUp) {
-                            onRequestInteraction("raise_hand")
+                        if raiseHand.visible {
+                            CtrlBtnView(icon: EduIcons.frontHand, label: EduI18n.text("controlRaiseHand"), active: handRaised, enabled: !raiseHand.disabled) {
+                                onToggleHand()
+                            }
                         }
-                        CtrlBtnView(icon: EduIcons.screenShare, label: permissionLabel(EduI18n.text("controlShare"), "share_screen"), active: sharing, enabled: !permissionDeniedActions.contains("share_screen")) {
-                            onRequestInteraction("share_screen")
+                        if share.visible {
+                            CtrlBtnView(icon: EduIcons.screenShare, label: restrictedLabel(EduI18n.text("controlShare"), share), active: localScreenSharing, enabled: !share.disabled) {
+                                onToggleScreenShare()
+                            }
                         }
-                        if showCourseware {
+                        if showCourseware && courseware.visible {
                             CtrlBtnView(
                                 icon: EduIcons.slideshow,
                                 label: EduI18n.text("controlSlides"),
                                 active: coursewareOpen,
+                                enabled: !courseware.disabled,
                                 action: onToggleCourseware
                             )
                         }
@@ -244,11 +261,5 @@ struct FloatingToolbarView: View {
         }
         .animation(.timingCurve(0.4, 0, 0.2, 1, duration: EduMotion.floatExpand), value: expanded)
         .animation(.easeOut(duration: 0.2), value: layoutOpen)
-    }
-
-    private func permissionLabel(_ label: String, _ action: String) -> String {
-        permissionDeniedActions.contains(action)
-            ? "\(label) · \(EduI18n.text("permissionUnavailableShort"))"
-            : label
     }
 }

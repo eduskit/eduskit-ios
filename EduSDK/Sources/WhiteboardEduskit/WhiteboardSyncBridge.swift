@@ -5,6 +5,8 @@ import Foundation
 public final class WhiteboardSyncBridge {
     private var sender: ((String) throws -> Void)?
     private var liveStrokeSender: ((String) throws -> Void)?
+    private var mediaSender: ((String) throws -> Void)?
+    private var mediaSessionId: String?
     private var sendFailureHandler: ((Error) throws -> Void)?
     private var messageHandler: ((Any) -> Void)?
     private let workerQueue = DispatchQueue(label: "edusdk.whiteboard.bridge")
@@ -19,12 +21,21 @@ public final class WhiteboardSyncBridge {
     public func bindSender(
         _ next: ((String) throws -> Void)?,
         liveStroke: ((String) throws -> Void)? = nil,
+        media: ((String) throws -> Void)? = nil,
         onFailure: ((Error) throws -> Void)? = nil
     ) {
         stateLock.lock()
         sender = next
         liveStrokeSender = liveStroke
+        mediaSender = media
         sendFailureHandler = onFailure
+        stateLock.unlock()
+    }
+
+    /// 当前白板媒体会话。播放包只在这个会话里收发。
+    public func bindMediaSession(_ sessionId: String?) {
+        stateLock.lock()
+        mediaSessionId = sessionId.flatMap { $0.isEmpty ? nil : $0 }
         stateLock.unlock()
     }
 
@@ -105,11 +116,39 @@ public final class WhiteboardSyncBridge {
         }
     }
 
+    /// 课件播放入站。只把本会话的 payload 交给 DrawsKit，别的会话直接丢掉。
+    public func receiveMedia(_ payloadJson: String) {
+        stateLock.lock()
+        let epoch = generation
+        stateLock.unlock()
+        workerQueue.async { [weak self] in
+            guard let self, self.isCurrent(epoch),
+                  let data = payloadJson.data(using: .utf8),
+                  let envelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let incoming = envelope[MediaWire.sessionId] as? String,
+                  let payload = envelope[MediaWire.payload]
+            else { return }
+            self.stateLock.lock()
+            let expected = self.mediaSessionId
+            self.stateLock.unlock()
+            guard let expected, incoming == expected else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isCurrent(epoch) else { return }
+                self.stateLock.lock()
+                let handler = self.messageHandler
+                self.stateLock.unlock()
+                handler?(payload)
+            }
+        }
+    }
+
     public func clear() {
         stateLock.lock()
         generation &+= 1
         sender = nil
         liveStrokeSender = nil
+        mediaSender = nil
+        mediaSessionId = nil
         sendFailureHandler = nil
         messageHandler = nil
         pendingLiveStrokes.removeAll()
@@ -132,6 +171,10 @@ public final class WhiteboardSyncBridge {
 
     private func sendObject(_ payload: Any, raw: String) {
         guard let object = payload as? [String: Any] else { return }
+        if object[MediaWire.type] as? String == MediaWire.messageType {
+            sendMedia(object)
+            return
+        }
         let live = (object["stroke_id"] as? String)?.isEmpty == false
             && (object["phase"] as? String)?.isEmpty == false
         let sync = (object["op_id"] as? String)?.isEmpty == false
@@ -144,6 +187,33 @@ public final class WhiteboardSyncBridge {
         let activeSender = live ? liveStrokeSender : sender
         stateLock.unlock()
         guard let activeSender else { return }
+        do {
+            try activeSender(raw)
+        } catch {
+            reportSendFailure(error)
+        }
+    }
+
+    private func sendMedia(_ object: [String: Any]) {
+        stateLock.lock()
+        let sessionId = mediaSessionId
+        let activeSender = mediaSender
+        stateLock.unlock()
+        guard let sessionId else {
+            reportSendFailure(WhiteboardSyncBridgeError.missingMediaSession)
+            return
+        }
+        guard let activeSender else { return }
+        let envelope: [String: Any] = [
+            MediaWire.sessionId: sessionId,
+            MediaWire.payload: object,
+        ]
+        guard JSONSerialization.isValidJSONObject(envelope),
+              let data = try? JSONSerialization.data(withJSONObject: envelope),
+              let raw = String(data: data, encoding: .utf8) else {
+            reportSendFailure(WhiteboardSyncBridgeError.missingMediaSession)
+            return
+        }
         do {
             try activeSender(raw)
         } catch {
@@ -170,8 +240,21 @@ public final class WhiteboardSyncBridge {
     }
 }
 
+private enum MediaWire {
+    static let messageType = "drawskit_media_status"
+    static let type = "type"
+    static let sessionId = "session_id"
+    static let payload = "payload"
+}
+
 private enum WhiteboardSyncBridgeError: LocalizedError {
     case ambiguousPayload
+    case missingMediaSession
 
-    var errorDescription: String? { "ambiguous DrawsKit sync payload" }
+    var errorDescription: String? {
+        switch self {
+        case .ambiguousPayload: return "ambiguous DrawsKit sync payload"
+        case .missingMediaSession: return "whiteboard media session is required"
+        }
+    }
 }

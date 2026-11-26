@@ -25,7 +25,8 @@ enum SignalParser {
 
     static func parseSignalEnvelope(obj: [String: Any]) -> ClassroomImSignalEnvelope? {
         let type = (obj["type"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !type.isEmpty, isClassroomImSignalType(type) else { return nil }
+        // Core owns signal routing after the authenticated transport boundary.
+        guard !type.isEmpty else { return nil }
         let signalId = (obj["signalId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !signalId.isEmpty else { return nil }
         var data = obj["data"] as? [String: Any] ?? [:]
@@ -40,7 +41,8 @@ enum SignalParser {
             classroomId: obj["classroomId"] as? String,
             appId: obj["appId"] as? String,
             ts: obj["ts"] as? String,
-            data: data
+            data: data,
+            extras: obj.filter { !classroomImSignalEnvelopeKeys.contains($0.key) }
         )
     }
 

@@ -75,6 +75,7 @@ enum EduIconCodepoints {
         "mic_off": 0xE02B,
         "near_me": 0xE569,
         "notifications": 0xE7F4,
+        "person": 0xE7FD,
         "pending": 0xEF64,
         "picture_as_pdf": 0xE415,
         "radio_button_unchecked": 0xE836,

@@ -11,6 +11,7 @@ private enum MainVideoStageTokens {
 struct MainVideoStageView: View {
     let teacher: ClassroomParticipant?
     var showLiveBadge: Bool = false
+    @Environment(\.liveUiSnapshot) private var liveSnapshot
 
     var body: some View {
         ZStack {
@@ -18,6 +19,12 @@ struct MainVideoStageView: View {
                 .fill(EduColors.surfaceLow)
             if let teacher {
                 ParticipantVideoTile(participant: teacher, featured: true, showLiveBadge: showLiveBadge)
+                if let audioName = liveSnapshot.flatMap(LiveStreams.audioStreamName) {
+                    LiveVideoSlotView(streamName: audioName)
+                        .frame(width: 1, height: 1)
+                        .opacity(0)
+                        .allowsHitTesting(false)
+                }
             } else {
                 VStack(spacing: MainVideoStageTokens.waitingStackSpacing) {
                     EduIcon(
@@ -28,10 +35,6 @@ struct MainVideoStageView: View {
                     Text(EduI18n.text("teacherWaiting"))
                         .font(EduFont.sans(MainVideoStageTokens.titleFontSize, weight: .semibold))
                         .foregroundStyle(EduColors.onSurface)
-                    Text(EduI18n.text("teacherWaitingHint"))
-                        .font(EduFont.sans(MainVideoStageTokens.hintFontSize, weight: .regular))
-                        .foregroundStyle(EduColors.onSurfaceVariant)
-                        .multilineTextAlignment(.center)
                 }
                 .padding(MainVideoStageTokens.waitingPadding)
             }

@@ -7,31 +7,29 @@ public enum WhiteboardLayoutDefaults {
     public static let aspectRatio: CGFloat = 16.0 / 9.0
 }
 
-/// 白板初始化参数，透传到 `DrawsKit`。字段与 Android 端 `WhiteboardConfig` 对齐。
+/// 白板会话初始化参数，全部来自 Core 下发的白板凭证，透传到 `DrawsKit`。
+/// 字段与 Android 端 `WhiteboardConfig` 对齐。
 public struct WhiteboardConfig: Equatable {
     public var id: String
     public var roomId: String
     public var appId: String
     public var userId: String
     public var token: String
-    public var serverEnvironment: String
-    public var serverHost: String?
+    public var serverHost: String
 
     public init(
-        id: String = "whiteboard",
-        roomId: String = "edu-demo-room",
-        appId: String = "1400000000",
-        userId: String = "demo_user",
-        token: String = "demo_sig",
-        serverEnvironment: String = WhiteboardServerDefaults.environment,
-        serverHost: String? = nil
+        roomId: String,
+        appId: String,
+        userId: String,
+        token: String,
+        serverHost: String,
+        id: String = WhiteboardServerDefaults.canvasId
     ) {
         self.id = id
         self.roomId = roomId
         self.appId = appId
         self.userId = userId
         self.token = token
-        self.serverEnvironment = serverEnvironment
         self.serverHost = serverHost
     }
 }
@@ -43,18 +41,15 @@ public struct WhiteboardConfig: Equatable {
 ///   离开课堂调用 `WhiteboardHost.endSession()`。
 /// - `NativeEngine.isLibLoaded` 为 false 时展示 `WhiteboardUnavailableView`。
 public struct WhiteboardCanvas: View {
-    public var config: WhiteboardConfig
     @ObservedObject private var host = WhiteboardHost.shared
 
-    public init(config: WhiteboardConfig = WhiteboardConfig()) {
-        self.config = config
-    }
+    public init() {}
 
     public var body: some View {
         if NativeEngine.isLibLoaded {
             if host.hasJoinCredentials {
                 ZStack {
-                    WhiteboardCanvasRepresentable(config: config)
+                    WhiteboardCanvasRepresentable()
                     if host.engineReady && host.coursewareLoading {
                         CoursewareLoadingOverlayView(
                             message: host.coursewareLoadMessage.isEmpty
@@ -103,9 +98,6 @@ private struct WhiteboardWaitingOverlayView: View {
                 Text(EduI18n.text("whiteboardWaitingTitle"))
                     .font(EduFont.sans(14, weight: .semibold))
                     .foregroundStyle(EduColors.onSurface)
-                Text(EduI18n.text("whiteboardWaitingHint"))
-                    .font(EduFont.sans(12))
-                    .foregroundStyle(EduColors.onSurfaceVariant)
             }
         }
         .padding(.leading, 13)
@@ -140,6 +132,7 @@ private struct WhiteboardConnectionStateView: View {
     }
 
     var body: some View {
+        if !failed && !disabled { ClassroomSkeleton(kind: .board) } else {
         VStack(spacing: 12) {
             EduIcon(
                 failed ? EduIcons.warning : EduIcons.pending,
@@ -160,6 +153,7 @@ private struct WhiteboardConnectionStateView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(24)
         .background(EduColors.surfaceLow)
+        }
     }
 }
 
@@ -182,7 +176,6 @@ private struct CoursewareLoadingOverlayView: View {
 // MARK: - UIViewRepresentable
 
 private struct WhiteboardCanvasRepresentable: UIViewRepresentable {
-    let config: WhiteboardConfig
 
     /// `DrawsKitView` is session-persistent and is reparented when SwiftUI swaps
     /// portrait/landscape classroom trees. Auto Layout can leave that reused
@@ -196,6 +189,15 @@ private struct WhiteboardCanvasRepresentable: UIViewRepresentable {
         override func layoutSubviews() {
             super.layoutSubviews()
             guard let surface else { return }
+            // PiP owns the surface while it is attached elsewhere. Reclaim only after that owner releases it.
+            if surface.superview == nil {
+                surface.translatesAutoresizingMaskIntoConstraints = true
+                surface.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+                surface.frame = bounds
+                addSubview(surface)
+                WhiteboardHost.shared.bindPersistentSurface(boardContainer: self)
+            }
+            guard surface.superview === self else { return }
             if surface.frame != bounds {
                 surface.frame = bounds
             }
@@ -208,7 +210,7 @@ private struct WhiteboardCanvasRepresentable: UIViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(config: config)
+        Coordinator()
     }
 
     func makeUIView(context: Context) -> UIView {
@@ -231,14 +233,8 @@ private struct WhiteboardCanvasRepresentable: UIViewRepresentable {
     }
 
     final class Coordinator {
-        let config: WhiteboardConfig
-
-        init(config: WhiteboardConfig) {
-            self.config = config
-        }
-
         func installSurface(in host: UIView, claimIfOwnedByOther: Bool) {
-            guard let surface = WhiteboardHost.shared.acquireSurface(config: config) else { return }
+            guard let surface = WhiteboardHost.shared.acquireSurface() else { return }
             if let owner = surface.superview, owner !== host {
                 guard claimIfOwnedByOther else { return }
                 surface.removeFromSuperview()
@@ -256,14 +252,14 @@ private struct WhiteboardCanvasRepresentable: UIViewRepresentable {
             (host as? SurfaceHostView)?.surface = surface
             host.setNeedsLayout()
             host.layoutIfNeeded()
-            WhiteboardHost.shared.bindPersistentSurface(config: config, boardContainer: host)
+            WhiteboardHost.shared.bindPersistentSurface(boardContainer: host)
         }
     }
 }
 
 // MARK: - Fallback
 
-/// FFI 未加载时的兜底视图：告知使用方架构限制。iOS 侧通常只在极端情况下命中。
+/// Native loading failure: concise user status; technical details stay in diagnostics.
 private struct WhiteboardUnavailableView: View {
     var body: some View {
         VStack(spacing: 12) {
@@ -271,17 +267,14 @@ private struct WhiteboardUnavailableView: View {
             Text(EduI18n.text("whiteboardNativeMissing"))
                 .font(EduFont.sans(14, weight: .semibold))
                 .foregroundStyle(EduColors.onSurface)
-            Text(
-                """
-                白板组件暂时不可用，请退出课堂后重试。
-                """
-            )
-            .font(EduFont.sans(12))
-            .foregroundStyle(EduColors.onSurfaceVariant)
-            .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(24)
         .background(EduColors.surfaceLow)
+        .task {
+            await Task.detached(priority: .utility) {
+                NSLog("EduSDKUI: DrawsKit native FFI is unavailable.")
+            }.value
+        }
     }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import AVFoundation
 import EduSDK
 #if canImport(UIKit)
 import UIKit
@@ -10,13 +11,16 @@ public final class ClassroomController: ObservableObject {
     public let options: EduClassroomOptions
     @Published public private(set) var snapshot: UiSnapshot
 
+    @Published private(set) var toolsView: TeachingToolsView?
+
     private var sdk: EduSdk
+    private let continuationBinding: ClassroomContinuationBinding?
     private var unsubs: [() -> Void] = []
     private var joinSucceeded = false
     private var feedbackQueue: [UiFeedback] = []
     private var feedbackActionHandlers: [UInt64: (String) -> Void] = [:]
-    private var lastErrorSignature = ""
-    private var lastErrorAt: TimeInterval = 0
+    private var endConfirmId: UInt64?
+    private lazy var feedbackPresenter = FeedbackPresenter(locale: options.localeTag, onFrame: { [weak self] frame in self?.applyFeedbackFrame(frame) }, onFailure: { error in NSLog("EduSDK feedback presentation failed: %@", String(describing: error)) })
     private var classroomStatusFeedbackId: UInt64?
     private var lastClassroomFeedbackKey: String?
     private var mediaOpenHintFeedbackId: UInt64?
@@ -26,26 +30,36 @@ public final class ClassroomController: ObservableObject {
     private let writeGate = WhiteboardWriteGate()
     private let initQueue = DispatchQueue(label: Tokens.initQueueLabel, qos: .userInitiated)
     private let queryQueue = DispatchQueue(label: Tokens.queryQueueLabel, qos: .userInitiated)
+    private let exportQueue=DispatchQueue(label:"edusdk.classroom.export-file",qos:.userInitiated)
+    private let exportGate=TeachingToolExportGate()
     private var timerQueryInFlight = false
     private var policyQueryGeneration: UInt64 = 0
     private var classroomTimer: Timer?
     /// IM 消息去重与批量投递（MainActor 隔离）。
-    private var seenMessageIds: Set<String> = []
-    private var pendingMessages: [ImMessage] = []
-    private var messageFlushScheduled = false
     private var joinLocalUserId: String?
 
-    static func unbindWhiteboardSyncIfEnded(
-        phase: ClassPhase,
+    /// 终态判据用 `lifecycleStatus`：`ClassPhase.ended` 把 ended 与 expired 压成一个值，
+    /// 无法区分两个必须分开的终态。
+    static func unbindWhiteboardSyncIfTerminal(
+        lifecycleStatus: ClassroomLifecycleStatus,
         unbind: () -> Void = { WhiteboardHost.shared.bindSyncSender(nil) }
     ) {
-        guard phase == .ended else { return }
+        guard lifecycleStatus == .ended || lifecycleStatus == .expired else { return }
         unbind()
     }
 
     public init(options: EduClassroomOptions) {
         self.options = options
-        self.sdk = Self.makeSdk(options: options)
+        weak var owner: ClassroomController?
+        let binding = options.continuation.map { _ in
+            ClassroomContinuationBinding(options: options) { error in
+                Task { @MainActor in
+                    owner?.enqueueError(SdkError(code: .internal, message: error.localizedDescription))
+                }
+            }
+        }
+        self.continuationBinding = binding
+        self.sdk = Self.makeSdk(options: options, continuation: binding)
         self.snapshot = UiSnapshot(
             initStatus: .loading,
             classroomId: options.classroomId,
@@ -53,9 +67,384 @@ public final class ClassroomController: ObservableObject {
             displayName: options.displayName,
             badgeText: EduI18n.text("statusConnecting")
         )
+        owner = self
+        guard options.continuation != nil else { return }
+        audioInterruption = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: AVAudioSession.sharedInstance(), queue: nil
+        ) { [weak self] note in
+            let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            guard let raw, let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+            if type == .began {
+                Task { @MainActor in self?.announceAudioInterruption() }
+                return
+            }
+            let optionRaw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+            guard AVAudioSession.InterruptionOptions(rawValue: optionRaw).contains(.shouldResume) else { return }
+            Task { @MainActor in
+                guard let self, let view = self.snapshot.continuation, view.playbackAllowed && view.returnEntry else { return }
+                Self.activateBackgroundAudio(true)
+            }
+        }
+    }
+
+    func classroomPresentation(visible: Bool, scene: UIWindowScene?) {
+        continuationBinding?.presentation(visible: visible, scene: scene)
+    }
+
+    private var windowPort: ContinuationWindowPort?
+    private var stopWindow: (() -> Void)?
+    private var audioInterruption: NSObjectProtocol?
+
+    func bindContinuationWindow(_ port: ContinuationWindowPort?, stop: (() -> Void)? = nil) {
+        windowPort = port
+        stopWindow = stop
+        sdk.bindContinuationWindow(port)
+    }
+
+    private var announcedLimitations: Set<String> = []
+
+    private func announceContinuationLimitations(_ limitations: [String]) {
+        let next = Set(limitations)
+        let fresh = next.subtracting(announcedLimitations)
+        announcedLimitations = next
+        if fresh.contains("window_failed") {
+            presentFeedback(FeedbackRequest.create(
+                mode: .toast, tone: .warning, message: EduI18n.text("continuationWindowFailed"),
+                autoDismissMs: Tokens.toastAutoDismissMs
+            ))
+        }
+        if fresh.contains("background_audio_unavailable") {
+            presentFeedback(FeedbackRequest.create(
+                mode: .toast, tone: .warning, message: EduI18n.text("continuationBackgroundHoldFailed"),
+                autoDismissMs: Tokens.toastAutoDismissMs
+            ))
+        }
+    }
+
+    private func announceAudioInterruption() {
+        guard snapshot.continuation?.playbackAllowed == true else { return }
+        presentFeedback(FeedbackRequest.create(
+            mode: .toast, tone: .warning, message: EduI18n.text("continuationAudioInterrupted"),
+            autoDismissMs: Tokens.toastAutoDismissMs
+        ))
+    }
+
+    func continuationContentReady(_ content: String) -> Bool {
+        switch content {
+        case "whiteboard":
+            return WhiteboardHost.shared.engineReady && WhiteboardHost.shared.persistentSurface != nil
+        case "teacher":
+            return snapshot.featuredTeacher != nil || snapshot.liveStreams.contains { $0.streamType == LiveStreamType.main.rawValue && !$0.publisherUserId.isEmpty }
+        case "remote_screen":
+            return !snapshot.screenShareUserIds.isEmpty || snapshot.liveStreams.contains { $0.streamType == LiveStreamType.aux.rawValue && !$0.publisherUserId.isEmpty }
+        default:
+            return false
+        }
+    }
+
+    /// Moves the one live renderer Core selected. An empty host is a failed window, never a still image.
+    func attachContinuationContent(_ content: String, to host: UIView) -> Bool {
+        releaseContinuationVideo()
+        switch content {
+        case "whiteboard":
+            guard WhiteboardHost.shared.engineReady, let surface = WhiteboardHost.shared.persistentSurface else { return false }
+            surface.translatesAutoresizingMaskIntoConstraints = true
+            surface.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            surface.frame = host.bounds
+            host.addSubview(surface)
+            WhiteboardHost.shared.bindPersistentSurface(boardContainer: host)
+            return true
+        case "teacher":
+            if let teacher = snapshot.featuredTeacher {
+                if let stream = LiveStreams.byUser(snapshot)[teacher.id] { return attachContinuationLive(stream, to: host) }
+                return attachContinuationRtc(VideoSlot(userId: teacher.id, streamType: .camera), to: host)
+            }
+            guard let stream = snapshot.liveStreams.first(where: { $0.streamType == LiveStreamType.main.rawValue && !$0.publisherUserId.isEmpty }) else { return false }
+            return attachContinuationLive(stream.streamName, to: host)
+        case "remote_screen":
+            if let presenter = snapshot.screenSharePresenter() {
+                if let stream = LiveStreams.auxStreamName(snapshot, userId: presenter.userId) { return attachContinuationLive(stream, to: host) }
+                return attachContinuationRtc(VideoSlot(userId: presenter.userId, streamType: .screen), to: host)
+            }
+            guard let stream = snapshot.liveStreams.first(where: { $0.streamType == LiveStreamType.aux.rawValue && !$0.publisherUserId.isEmpty }) else { return false }
+            return attachContinuationLive(stream.streamName, to: host)
+        default:
+            return false
+        }
+    }
+
+    func releaseContinuationContent() {
+        releaseContinuationVideo()
+    }
+
+    private var continuationVideo: (slot: VideoSlot?, stream: String?, view: UIView)?
+
+    private func attachContinuationRtc(_ slot: VideoSlot, to host: UIView) -> Bool {
+        let view = RtcVideoHostView()
+        view.frame = host.bounds
+        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.onReady = { [weak self] ready in self?.bindUserVideo(slot: slot, view: ready) }
+        host.addSubview(view)
+        continuationVideo = (slot, nil, view)
+        return true
+    }
+
+    private func attachContinuationLive(_ stream: String, to host: UIView) -> Bool {
+        let view = RtcVideoHostView()
+        view.frame = host.bounds
+        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.onReady = { [weak self] ready in self?.bindLiveStream(streamName: stream, view: ready) }
+        host.addSubview(view)
+        continuationVideo = (nil, stream, view)
+        return true
+    }
+
+    private func releaseContinuationVideo() {
+        guard let bound = continuationVideo else { return }
+        continuationVideo = nil
+        if let slot = bound.slot { unbindUserVideo(slot: slot, view: bound.view) }
+        if let stream = bound.stream { unbindLiveStream(streamName: stream, view: bound.view) }
+        bound.view.removeFromSuperview()
+    }
+
+    func promptClassroomBack(onContinue: @escaping () -> Void, onLeave: @escaping () -> Void) {
+        switch snapshot.continuation?.settings?.settings.classroomBack {
+        case "continue": onContinue()
+        case "leave": onLeave()
+        default:
+            var remember = false
+            presentFeedback(FeedbackRequest.create(
+                mode: .dialog, tone: .info, message: EduI18n.text("continuationCloseMessage"),
+                autoDismissMs: nil, modal: true,
+                actions: [
+                    FeedbackAction(id: "remember", label: EduI18n.text("continuationRememberClose"), dismissOnClick: false),
+                    FeedbackAction(id: "continue", label: EduI18n.text("continuationCloseContinue"), style: .primary),
+                    FeedbackAction(id: "leave", label: EduI18n.text("continuationCloseLeave"), style: .danger),
+                    FeedbackAction(id: "cancel", label: EduI18n.text("continuationCloseCancel")),
+                ]
+            )) { [weak self] action in
+                guard let self else { return }
+                switch action {
+                case "remember": remember = !remember
+                case "continue":
+                    if remember { self.updateContinuationPreference("classroom_back", choice: "continue") }
+                    onContinue()
+                case "leave":
+                    if remember { self.updateContinuationPreference("classroom_back", choice: "leave") }
+                    onLeave()
+                default: break
+                }
+            }
+        }
+    }
+
+    func updateContinuationPreference(_ field: String, enabled: Bool? = nil, choice: String? = nil) {
+        guard let view = snapshot.continuation?.settings, view.storage == "ready" || view.storage == "saving" else { return }
+        let media = view.settings.media
+        let record: [String: Any] = [
+            "media": [
+                "auto_window": field == "auto_window" ? enabled == true : media.autoWindow,
+                "background_audio": field == "background_audio" ? enabled == true : media.backgroundAudio,
+                "background_microphone": field == "background_microphone" ? enabled == true : media.backgroundMicrophone,
+            ],
+            "classroom_back": field == "classroom_back" ? choice as Any? ?? NSNull() : view.settings.classroomBack as Any? ?? NSNull(),
+            "window_close": field == "window_close" ? choice as Any? ?? NSNull() : view.settings.windowClose as Any? ?? NSNull(),
+        ]
+        let sdkRef = sdk
+        queryQueue.async {
+            guard let data = try? JSONSerialization.data(withJSONObject: ["type": "preferences", "settings": record]),
+                  let json = String(data: data, encoding: .utf8) else { return }
+            try? sdkRef.requestClassroomContinuation(json)
+        }
+    }
+
+    func loadTools(cursor: String? = nil) {
+        sendToolRequest { ["operation": "list", "cursor": cursor as Any? ?? NSNull(), "limit": 20] }
+    }
+    func loadToolDefinition(_ card: TeachingToolCard) {
+        sendToolRequest { ["operation": "definition", "sessionId": card.sessionId] }
+    }
+    @discardableResult
+    func updateTool(_ edit: TeachingToolEdit, draft: TeachingToolDraft, trueLabel: String, falseLabel: String, onRejected: (() -> Void)? = nil) -> String {
+        let requestId = UUID().uuidString
+        sendToolRequest(onRejected: onRejected) { ["operation": "update", "sessionId": edit.sessionId, "expectedRevision": edit.revision, "requestId": requestId,
+            "config": try draft.config(trueLabel: trueLabel, falseLabel: falseLabel)] }
+        return requestId
+    }
+    @discardableResult
+    func createTool(_ draft: TeachingToolDraft, trueLabel: String, falseLabel: String, onRejected: (() -> Void)? = nil) -> String {
+        let requestId = UUID().uuidString
+        sendToolRequest(onRejected: onRejected) { ["operation": "create", "requestId": requestId, "config": try draft.config(trueLabel: trueLabel, falseLabel: falseLabel)] }
+        return requestId
+    }
+    func loadToolHistory(cursor: String? = nil) {
+        sendToolRequest { ["operation": "history_list", "cursor": cursor as Any? ?? NSNull(), "limit": 20] }
+    }
+    func loadToolHistoryVersions(sessionId: String, cursor: String? = nil) {
+        sendToolRequest { ["operation": "history_versions", "sessionId": sessionId, "cursor": cursor as Any? ?? NSNull(), "limit": 20] }
+    }
+    func loadToolHistoryDetail(sessionId: String, revision: String) {
+        sendToolRequest { ["operation": "history_detail", "sessionId": sessionId, "revision": revision] }
+    }
+    func loadToolOwn(_ card: TeachingToolCard) {
+        sendToolRequest { guard let roundId = card.roundId else { throw NSError(domain: "TeachingToolForm", code: 3) }; return ["operation": "own", "sessionId": card.sessionId, "roundId": roundId] }
+    }
+    func loadToolResults(_ card: TeachingToolCard, cursor: String? = nil) {
+        sendToolRequest {
+            guard let roundId = card.roundId else { throw NSError(domain: "TeachingToolForm", code: 3) }
+            return ["operation": "results", "sessionId": card.sessionId, "roundId": roundId, "cursor": cursor as Any? ?? NSNull(), "limit": 20]
+        }
+    }
+    func reviewTool(_ card: TeachingToolCard, submission: TeachingToolSubmission, score: String, feedback: String) {
+        guard !toolMutationPending(card.sessionId) else { return }
+        sendToolRequest {
+            guard let roundId = card.roundId, let points = Int(score) else { throw NSError(domain: "TeachingToolForm", code: 4) }
+            return ["operation": "review", "sessionId": card.sessionId, "roundId": roundId, "userId": submission.userId,
+                "expectedSubmissionRevision": submission.revision, "requestId": UUID().uuidString, "score": points, "feedback": feedback]
+        }
+    }
+    func manageToolGroup(_ card: TeachingToolCard, action: String, groupId: String? = nil, first: String? = nil, second: String? = nil, name: String? = nil) {
+        guard !toolMutationPending(card.sessionId) else { return }
+        sendToolRequest {
+            var body: [String: Any] = ["action": action]
+            switch action {
+            case "rename_group": body["groupId"] = groupId; body["name"] = name
+            case "set_group_leader": body["groupId"] = groupId; body["userId"] = first as Any? ?? NSNull()
+            case "move_member": body["groupId"] = groupId; body["userId"] = first
+            case "swap_members": body["firstUserId"] = first; body["secondUserId"] = second
+            default: throw NSError(domain: "TeachingToolForm", code: 6)
+            }
+            return ["operation": "execute", "sessionId": card.sessionId, "expectedRevision": card.revision, "requestId": UUID().uuidString, "action": body]
+        }
+    }
+    func loadToolScorePeriods(_ card: TeachingToolCard, cursor: String? = nil) {
+        sendToolRequest { ["operation": "score_periods", "sessionId": card.sessionId, "cursor": cursor as Any? ?? NSNull(), "limit": 20] }
+    }
+    func loadToolScores(_ card: TeachingToolCard, periodId: String, view: String, kind: String? = nil, id: String? = nil, cursor: String? = nil, limit: Int = 20) {
+        sendToolRequest { ["operation": "scores", "sessionId": card.sessionId, "query": ["periodId": periodId, "view": view,
+            "targetKind": kind as Any? ?? NSNull(), "targetId": id as Any? ?? NSNull(), "cursor": cursor as Any? ?? NSNull(), "limit": limit]] }
+    }
+    func reverseToolScore(_ card: TeachingToolCard, entryId: String, reason: String) {
+        guard !toolMutationPending(card.sessionId) else { return }
+        sendToolRequest { ["operation": "execute", "sessionId": card.sessionId, "expectedRevision": card.revision, "requestId": UUID().uuidString,
+            "action": ["action": "reverse_score", "entryId": entryId, "reason": reason]] }
+    }
+    func awardToolScore(_ card: TeachingToolCard, kind: String, id: String, delta: String, reason: String) {
+        guard !toolMutationPending(card.sessionId) else { return }
+        sendToolRequest {
+            guard let points = Int(delta) else { throw NSError(domain: "TeachingToolForm", code: 5) }
+            return ["operation": "execute", "sessionId": card.sessionId, "expectedRevision": card.revision, "requestId": UUID().uuidString,
+                "action": ["action": "award_score", "target": ["kind": kind, "id": id], "delta": points, "reason": reason]]
+        }
+    }
+    func loadToolStudents(cursor: String? = nil) {
+        let sdkRef = sdk; let epoch = initEpoch.current(); let gate = initEpoch
+        queryQueue.async { [weak self] in
+            guard gate.isCurrent(epoch) else { return }
+            do { try sdkRef.loadMembers(cursor) }
+            catch {
+                Task { @MainActor [weak self] in
+                    guard let self, self.initEpoch.isCurrent(epoch) else { return }
+                    self.enqueueError(error as? SdkError ?? SdkError(code: .internal, message: error.localizedDescription))
+                }
+            }
+        }
+    }
+    func controlTool(_ card: TeachingToolCard, action: String, parameter: String) {
+        guard !toolMutationPending(card.sessionId) else { return }
+        sendToolRequest {
+            var body: [String: Any] = ["action": action]
+            if action == "lap" { body["label"] = parameter }
+            if action == "hide_term" || action == "restore_term" { body["termKey"] = parameter }
+            if action == "adjust" {
+                let value = NSDecimalNumber(string: parameter, locale: Locale(identifier: "en_US_POSIX")).multiplying(by: 1000)
+                guard let milliseconds = Int64(value.stringValue) else { throw NSError(domain: "TeachingToolForm", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid adjustment"]) }
+                body["deltaMs"] = milliseconds
+            }
+            return ["operation": "execute", "sessionId": card.sessionId, "expectedRevision": card.revision, "requestId": UUID().uuidString, "action": body]
+        }
+    }
+    func submitTool(_ card: TeachingToolCard, selection: [String], text: String) {
+        guard card.canSubmit && !toolMutationPending(card.sessionId) else { return }
+        sendToolRequest {
+            let answer: [String: Any]
+            switch card.input?.type {
+            case "buzz": answer = ["kind": "buzz"]
+            case "text": answer = ["kind": "text", "text": text]
+            case "words": answer = ["kind": "words", "words": text.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }]
+            case "single_choice", "multiple_choice": answer = ["kind": "choice", "optionIds": selection]
+            default: throw NSError(domain: "TeachingToolForm", code: 2, userInfo: [NSLocalizedDescriptionKey: "Unknown input"])
+            }
+            guard let roundId = card.roundId else { throw NSError(domain: "TeachingToolForm", code: 3, userInfo: [NSLocalizedDescriptionKey: "Missing round"]) }
+            return ["operation": "submit", "sessionId": card.sessionId, "requestId": UUID().uuidString,
+                "submission": ["roundId": roundId, "expectedSubmissionRevision": card.ownRevision as Any? ?? NSNull(), "answer": answer]]
+        }
+    }
+    func toolMutationPending(_ sessionId: String) -> Bool {
+        toolsView?.operations.contains { $0.sessionId == sessionId && $0.blocksWrites } == true
+    }
+
+    func createToolExport(_ card: TeachingToolCard, currentRound: Bool) {
+        guard card.canExport,!toolMutationPending(card.sessionId),!currentRound || card.roundId != nil else {return}
+        sendToolRequest { ["operation":"export","sessionId":card.sessionId,"expectedRevision":card.revision,"requestId":UUID().uuidString,"roundId":currentRound ? card.roundId as Any : NSNull(),"format":"csv"] }
+    }
+    func refreshToolExport(_ entry:TeachingToolExport) {
+        guard toolsView?.exports.contains(where:{$0.id==entry.id && $0.job.sessionId==entry.job.sessionId})==true else {return}
+        sendToolRequest { ["operation":"export_get","sessionId":entry.job.sessionId,"exportId":entry.id] }
+    }
+    func downloadToolExport(_ entry:TeachingToolExport, completion:@escaping (URL?)->Void) {
+        let lifecycle=initEpoch;let epoch=lifecycle.current();let gate=exportGate
+        exportQueue.async { [weak self] in
+            let ticket=gate.ticket()
+            let current={lifecycle.isCurrent(epoch) && gate.permits(entry,ticket)}
+            let download=TeachingToolExportFile(entry:entry,isCurrent:current) { result in
+                Task { @MainActor [weak self] in
+                    guard let self,lifecycle.isCurrent(epoch) else {
+                        if case let .success(file)=result {DispatchQueue.global(qos:.utility).async {TeachingToolExportFile.remove(file)}}
+                        return
+                    }
+                    guard gate.permits(entry,ticket) else {
+                        if case let .success(file)=result {DispatchQueue.global(qos:.utility).async {TeachingToolExportFile.remove(file)}}
+                        completion(nil);return
+                    }
+                    switch result {
+                    case let .success(file):completion(file)
+                    case .failure:self.enqueueError(SdkError(code:.internal,message:EduI18n.text("tool_exportSaveFailed")));completion(nil)
+                    }
+                }
+            }
+            download.start()
+        }
+    }
+    func resolveTool(_ requestId: String) {
+        guard toolsView?.operations.contains(where: { $0.requestId == requestId && $0.canResolve }) == true else { return }
+        sendToolRequest { ["operation": "resolve", "requestId": requestId] }
+    }
+    func retryTool(_ requestId: String) {
+        guard toolsView?.operations.contains(where: { $0.requestId == requestId && $0.canRetry }) == true else { return }
+        sendToolRequest { ["operation": "retry", "requestId": requestId] }
+    }
+    private func sendToolRequest(onRejected: (() -> Void)? = nil, _ build: @escaping () throws -> [String: Any]) {
+        let sdkRef = sdk; let epoch = initEpoch.current(); let gate = initEpoch
+        queryQueue.async { [weak self] in
+            guard gate.isCurrent(epoch) else { return }
+            do {
+                let data = try JSONSerialization.data(withJSONObject: build())
+                try sdkRef.requestTeachingTools(String(decoding: data, as: UTF8.self))
+            } catch {
+                Task { @MainActor [weak self] in
+                    guard let self, self.initEpoch.isCurrent(epoch) else { return }
+                    onRejected?()
+                    self.enqueueError(error as? SdkError ?? SdkError(code: .internal, message: error.localizedDescription))
+                }
+            }
+        }
     }
 
     public func initialize() {
+        feedbackPresenter.removeGroup("classroom-entry-error")
+        exportGate.reset()
+        toolsView = nil
         stopClassroomTimer()
         clearClassroomStatusFeedback()
         lastClassroomFeedbackKey = nil
@@ -98,6 +487,9 @@ public final class ClassroomController: ObservableObject {
         }, liveStrokeSender: { [weak sdk] payloadJson in
             guard let sdk else { return }
             try sdk.sendWhiteboardLiveStroke(payloadJson: payloadJson)
+        }, mediaSender: { [weak sdk] payloadJson in
+            guard let sdk else { return }
+            try sdk.sendWhiteboardMedia(payloadJson: payloadJson)
         }, onFailure: { [weak self] error in
             Task { @MainActor in
                 self?.runIfCurrent(epoch) {
@@ -117,6 +509,11 @@ public final class ClassroomController: ObservableObject {
         let boundWriteGate = writeGate
         WhiteboardHost.shared.bindAuthExpired { [weak sdk] in
             sdk?.notifyWhiteboardCredentialsExpired()
+        }
+        WhiteboardHost.shared.bindRoomMediaFeedback { [weak self] error in
+            self?.enqueueError((error as? WhiteboardMediaRequestFailure)?.sdkError
+                ?? error as? SdkError
+                ?? SdkError(code:.whiteboardProviderError,message:error.localizedDescription))
         }
         WhiteboardHost.shared.bindReadinessReporter(
             onReady: { [weak sdk] boardId in sdk?.notifyWhiteboardReady(boardId: boardId) },
@@ -182,79 +579,47 @@ public final class ClassroomController: ObservableObject {
         }
     }
 
-    /// 消息高峰时逐条 `append` 会按消息数触发同样多次 `@Published` 发布，
-    /// `contains(where:)` 又是 O(n)；这里用 Set 去重，同一轮调度合并为一次发布。
-    private func appendImMessage(_ message: ImMessage) {
-        guard seenMessageIds.insert(message.id).inserted else { return }
-        pendingMessages.append(message)
-        guard !messageFlushScheduled else { return }
-        messageFlushScheduled = true
-        Task { @MainActor [weak self] in
-            self?.flushPendingMessages()
-        }
-    }
-
-    private func flushPendingMessages() {
-        messageFlushScheduled = false
-        guard !pendingMessages.isEmpty else { return }
-        snapshot.messages.append(contentsOf: pendingMessages)
-        pendingMessages.removeAll(keepingCapacity: true)
-    }
-
     private func resetMessageBuffer() {
-        messageFlushScheduled = false
-        pendingMessages.removeAll()
-        seenMessageIds.removeAll()
+        snapshot.historyLoading = false; snapshot.historyHasMore = true; snapshot.historyError = false
     }
+
 
     public func retry() {
         dismissFeedback()
         retryWithoutFeedbackDismiss()
     }
 
-    public func dismissFeedback(id: UInt64? = nil) {
-        guard let current = feedbackQueue.first, id == nil || current.id == id else { return }
-        if current.id == classroomStatusFeedbackId { classroomStatusFeedbackId = nil }
-        let dismissingHint = current.id == mediaOpenHintFeedbackId
-        if dismissingHint { mediaOpenHintFeedbackId = nil }
-        feedbackActionHandlers.removeValue(forKey: current.id)
-        feedbackQueue.removeFirst()
-        snapshot.feedback = feedbackQueue.first
-        if dismissingHint && !hintActionInProgress {
-            let sdkRef = sdk
-            queryQueue.async { try? sdkRef.dismissMediaOpenHint() }
-        }
+    public func dismissFeedback(id: UInt64? = nil, reason: String = "programmatic") {
+        if let id = id ?? snapshot.feedback?.id { feedbackPresenter.dismiss(id, reason: reason) }
     }
-
-    public func presentFeedback(_ feedback: UiFeedback, onAction: ((String) -> Void)? = nil) {
-        if let onAction { feedbackActionHandlers[feedback.id] = onAction }
-        if feedback.mode == .toast {
-            feedbackQueue.filter { $0.mode == .toast }
-                .forEach { feedbackActionHandlers.removeValue(forKey: $0.id) }
-            feedbackQueue.removeAll { $0.mode == .toast }
-            feedbackQueue.insert(feedback, at: 0)
-        } else {
-            feedbackQueue.append(feedback)
-        }
-        snapshot.feedback = feedbackQueue.first
+    public func feedbackShown(id: UInt64) { feedbackPresenter.shown(id) }
+    public func presentFeedback(_ request: FeedbackRequest, onAction: ((String) -> Void)? = nil) {
+        if let onAction { feedbackActionHandlers[request.id] = onAction }
+        feedbackPresenter.present(request)
     }
-
-    public func handleFeedbackAction(feedbackId: UInt64, actionId: String) {
-        guard let current = feedbackQueue.first, current.id == feedbackId else { return }
-        let handler = feedbackActionHandlers[feedbackId]
-        if current.id == mediaOpenHintFeedbackId && isMediaOpenHintAction(actionId) {
-            hintActionInProgress = true
-        }
-        if current.actions.first(where: { $0.id == actionId })?.dismissOnClick == true {
-            dismissFeedback(id: feedbackId)
-        }
-        handler?(actionId)
-        hintActionInProgress = false
-        if actionId == "retry" {
-            retryWithoutFeedbackDismiss()
-        }
-        if actionId == mediaOpenHintActionCheckDevices && handler == nil {
-            openDeviceCheck()
+    public func handleFeedbackAction(feedbackId: UInt64, actionId: String) { feedbackPresenter.action(feedbackId, actionId) }
+    private func applyFeedbackFrame(_ frame: FeedbackFrame) {
+        feedbackQueue = frame.queue
+        snapshot.feedback = frame.current
+        for effect in frame.receipts {
+            guard let id = UInt64(effect.feedbackId) else { continue }
+            if effect.type == "action", let actionId = effect.actionId {
+                let handler = feedbackActionHandlers[id]
+                if id == mediaOpenHintFeedbackId { hintActionInProgress = true }
+                handler?(actionId)
+                hintActionInProgress = false
+                if actionId == "retry" { retryWithoutFeedbackDismiss() }
+                if actionId == mediaOpenHintActionCheckDevices && handler == nil { openDeviceCheck() }
+            }
+            if effect.type != "action" || !frame.queue.contains(where: { $0.id == id }) {
+                feedbackActionHandlers.removeValue(forKey: id)
+                if id == endConfirmId { endConfirmId = nil }
+                if id == classroomStatusFeedbackId { classroomStatusFeedbackId = nil }
+                if id == mediaOpenHintFeedbackId {
+                    mediaOpenHintFeedbackId = nil
+                    if effect.type == "dismissed" { let sdkRef = sdk; queryQueue.async { try? sdkRef.dismissMediaOpenHint() } }
+                }
+            }
         }
     }
 
@@ -264,43 +629,60 @@ public final class ClassroomController: ObservableObject {
         WhiteboardHost.shared.bindSyncSender(nil)
         WhiteboardHost.shared.bindWriteAuthorizer(nil)
         WhiteboardHost.shared.bindAuthExpired(nil)
+        WhiteboardHost.shared.bindRoomMediaFeedback(nil)
         let oldSdk = sdk
-        sdk = Self.makeSdk(options: options)
-        initQueue.async {
-            oldSdk.destroy()
-        }
+        sdk = Self.makeSdk(options: options, continuation: continuationBinding)
+        Self.destroySdk(oldSdk)
         initialize()
     }
 
     private func enqueueError(_ error: SdkError) {
-        let now = Date.timeIntervalSinceReferenceDate
-        let signature = "\(error.code):\(error.message)"
-        if signature == lastErrorSignature && now - lastErrorAt < Tokens.errorDedupWindow { return }
-        lastErrorSignature = signature
-        lastErrorAt = now
-        feedbackQueue.append(
-            feedback(from: error, duringInitialization: !joinSucceeded, localeTag: options.localeTag)
-        )
-        snapshot.feedback = feedbackQueue.first
+        presentFeedback(feedback(from: error, duringInitialization: !joinSucceeded, localeTag: options.localeTag))
     }
 
-    public func sendImMessage(_ content: String) {
-        guard requestInteraction(Tokens.actionSendMessage) else { return }
+    public func loadImMessageHistory() {
+        guard sdk.classroomView().runtime.canLoadHistory else { return }
+        guard joinSucceeded, snapshot.initStatus == .ready else { return }
+        guard !snapshot.historyLoading, snapshot.historyHasMore || snapshot.historyError else { return }
+        snapshot.historyLoading = true; snapshot.historyError = false
+        let epoch = initEpoch.current()
         let sdkRef = sdk
-        initQueue.async { [weak self] in
+        Task { [weak self] in
             do {
-                try sdkRef.sendImMessage(content: content)
+                let cursor = sdkRef.getImHistoryState().page?.nextCursor
+                _ = try await sdkRef.loadImMessageHistory(options: ImHistoryOptions(cursor: cursor))
+                guard let self, self.initEpoch.isCurrent(epoch) else { return }
+                self.snapshot.historyHasMore = sdkRef.getImHistoryState().page?.hasMore ?? true
             } catch {
-                Task { @MainActor in
-                    guard let self else { return }
-                    self.enqueueError(
-                        error as? SdkError ?? SdkError(
-                            code: .internal,
+                guard let self, self.initEpoch.isCurrent(epoch) else { return }
+                self.snapshot.historyError = true
+                self.enqueueError(error as? SdkError ?? SdkError(code: .imProviderError, message: error.localizedDescription))
+            }
+            if let self, self.initEpoch.isCurrent(epoch) { self.snapshot.historyLoading = false }
+        }
+    }
+
+    public func sendImMessage(_ content: String) async -> Bool {
+        guard requestInteraction(Tokens.actionSendMessage) else { return false }
+        let epoch = initEpoch.current()
+        let gate = initEpoch
+        let sdkRef = sdk
+        return await withCheckedContinuation { completion in
+            initQueue.async { [weak self] in
+                guard gate.isCurrent(epoch) else { completion.resume(returning: false); return }
+                let result = Result { try sdkRef.sendImMessage(content: content) }
+                Task { @MainActor [weak self] in
+                    guard let self, self.initEpoch.isCurrent(epoch) else {
+                        completion.resume(returning: false); return
+                    }
+                    switch result {
+                    case .success: completion.resume(returning: true)
+                    case .failure(let error):
+                        self.enqueueError(error as? SdkError ?? SdkError(code: .internal,
                             message: error.localizedDescription.isEmpty
-                                ? EduI18n.text("feedbackOperationTitle")
-                                : error.localizedDescription
-                        )
-                    )
+                                ? EduI18n.text("feedbackOperationFailed") : error.localizedDescription))
+                        completion.resume(returning: false)
+                    }
                 }
             }
         }
@@ -319,7 +701,7 @@ public final class ClassroomController: ObservableObject {
                         error as? SdkError ?? SdkError(
                             code: .internal,
                             message: error.localizedDescription.isEmpty
-                                ? EduI18n.text("feedbackOperationTitle")
+                                ? EduI18n.text("feedbackOperationFailed")
                                 : error.localizedDescription
                         )
                     )
@@ -342,12 +724,10 @@ public final class ClassroomController: ObservableObject {
     }
 
     private func requestEndClassConfirm() {
-        if feedbackQueue.contains(where: { item in
-            item.actions.contains { $0.id == endClassConfirmAction }
-        }) {
-            return
-        }
-        presentFeedback(feedbackFromEndClassConfirm(localeTag: options.localeTag)) { [weak self] actionId in
+        guard endConfirmId == nil else { return }
+        let request = feedbackFromEndClassConfirm(localeTag: options.localeTag)
+        endConfirmId = request.id
+        presentFeedback(request) { [weak self] actionId in
             if actionId == endClassConfirmAction {
                 self?.endClass()
             }
@@ -367,7 +747,7 @@ public final class ClassroomController: ObservableObject {
                         error as? SdkError ?? SdkError(
                             code: .internal,
                             message: error.localizedDescription.isEmpty
-                                ? EduI18n.text("feedbackOperationTitle")
+                                ? EduI18n.text("feedbackOperationFailed")
                                 : error.localizedDescription
                         )
                     )
@@ -384,6 +764,7 @@ public final class ClassroomController: ObservableObject {
     }
 
     public func loadMoreMembers() {
+        guard sdk.classroomView().runtime.mode == "active" else { return }
         guard let cursor = snapshot.membersNextCursor, !cursor.isEmpty else { return }
         guard !snapshot.membersLoading else { return }
         snapshot.membersLoading = true
@@ -404,7 +785,7 @@ public final class ClassroomController: ObservableObject {
                         error as? SdkError ?? SdkError(
                             code: .internal,
                             message: error.localizedDescription.isEmpty
-                                ? EduI18n.text("feedbackOperationTitle")
+                                ? EduI18n.text("feedbackOperationFailed")
                                 : error.localizedDescription
                         )
                     )
@@ -414,6 +795,7 @@ public final class ClassroomController: ObservableObject {
     }
 
     public func leaveClassroom() {
+        joinSucceeded = false
         initEpoch.bump()
         clearClassroomStatusFeedback()
         clearListeners()
@@ -423,6 +805,7 @@ public final class ClassroomController: ObservableObject {
         WhiteboardHost.shared.bindSyncSender(nil)
         WhiteboardHost.shared.bindWriteAuthorizer(nil)
         WhiteboardHost.shared.bindAuthExpired(nil)
+        WhiteboardHost.shared.bindRoomMediaFeedback(nil)
         WhiteboardHost.shared.setLocalEditEnabled(false)
         let sdkRef = sdk
         initQueue.async {
@@ -431,12 +814,20 @@ public final class ClassroomController: ObservableObject {
     }
 
     #if os(iOS)
-    public func bindUserVideo(userId: String, view: UIView) {
-        sdk.bindUserVideo(userId: userId, view: view)
+    public func bindUserVideo(slot: VideoSlot, view: UIView) {
+        sdk.bindUserVideo(userId: slot.userId, view: view, streamType: slot.streamType)
     }
 
-    public func unbindUserVideo(userId: String, view: UIView) {
-        sdk.unbindUserVideo(userId: userId, view: view)
+    public func unbindUserVideo(slot: VideoSlot, view: UIView) {
+        sdk.unbindUserVideo(userId: slot.userId, view: view, streamType: slot.streamType)
+    }
+
+    public func bindLiveStream(streamName: String, view: UIView) {
+        sdk.bindLiveStream(streamName: streamName, view: view)
+    }
+
+    public func unbindLiveStream(streamName: String, view: UIView) {
+        sdk.unbindLiveStream(streamName: streamName, view: view)
     }
 
     public func startLocalPreview(view: UIView, cameraId: String? = nil) {
@@ -445,6 +836,7 @@ public final class ClassroomController: ObservableObject {
     #endif
 
     public func openDeviceCheck() {
+        guard sdk.classroomView().runtime.canInspectDevices else { return }
         snapshot.deviceCheckOpen = true
     }
 
@@ -548,6 +940,37 @@ public final class ClassroomController: ObservableObject {
         }
     }
 
+    public func raiseHand() {
+        guard requestInteraction(Tokens.actionRaiseHand) else { return }
+        let sdkRef = sdk
+        queryQueue.async { try? sdkRef.userRaiseHand() }
+    }
+
+    public func leaveStage() {
+        guard requestInteraction("manage_own_stage") else { return }
+        let sdkRef = sdk
+        queryQueue.async { try? sdkRef.userLeaveStage() }
+    }
+
+    public func cancelHand() {
+        let sdkRef = sdk
+        queryQueue.async { try? sdkRef.userCancelHand() }
+    }
+
+    /// 开启屏幕共享。是否真的推流以 onLocalScreenShareChanged 回执为准，
+    /// 用户可能在系统录屏授权弹窗上取消。
+    public func startScreenShare() {
+        guard requestInteraction(Tokens.actionShareScreen) else { return }
+        let sdkRef = sdk
+        queryQueue.async { try? sdkRef.startScreenShare() }
+    }
+
+    /// 停止不做权限门控：权限被中途撤销时仍必须能把屏幕收回来。
+    public func stopScreenShare() {
+        let sdkRef = sdk
+        queryQueue.async { try? sdkRef.stopScreenShare() }
+    }
+
     public func loadClassroomCourseware(_ completion: @escaping ([Courseware]) -> Void) {
         let sdkRef = sdk
         let epoch = initEpoch.current()
@@ -589,12 +1012,7 @@ public final class ClassroomController: ObservableObject {
             let manifest: Result<Any, Error>
             do {
                 let json = try await sdkRef.getCoursewareManifest(coursewareId: coursewareId)
-                let value: Any = {
-                    guard let data = json.data(using: .utf8),
-                          let object = try? JSONSerialization.jsonObject(with: data) else { return json }
-                    return object
-                }()
-                manifest = .success(value)
+                manifest = .success(json)
             } catch {
                 manifest = .failure(error)
             }
@@ -603,22 +1021,27 @@ public final class ClassroomController: ObservableObject {
                 case .failure(let error):
                     completion(.failure(error))
                 case .success(let value):
-                    guard let fileId = WhiteboardHost.shared.addTranscodeFile(value) else {
-                        completion(.failure(NSError(
-                            domain: Tokens.errorDomain,
-                            code: Tokens.errorCodeCoursewareLoadFailed,
-                            userInfo: [
-                                NSLocalizedDescriptionKey: EduI18n.text("whiteboardCoursewareFailed"),
-                            ]
-                        )))
-                        return
-                    }
-                    completion(.success(fileId))
+                    do {
+                        let fileId = try await WhiteboardHost.shared.addTranscodeFile(value)
+                        guard self.initEpoch.isCurrent(epoch) else { return }
+                        completion(.success(fileId))
+                    } catch { completion(.failure(error)) }
                 }
         }
     }
 
     public func destroy() {
+        ContinuationReturnEntry.shared.hide()
+        if let audioInterruption { NotificationCenter.default.removeObserver(audioInterruption) }
+        self.audioInterruption = nil
+        stopWindow?()
+        stopWindow = nil
+        releaseContinuationContent()
+        continuationBinding?.close()
+        feedbackPresenter.close()
+        joinSucceeded = false
+        exportGate.reset()
+        toolsView = nil
         initEpoch.bump()
         clearClassroomStatusFeedback()
         clearListeners()
@@ -629,15 +1052,69 @@ public final class ClassroomController: ObservableObject {
         WhiteboardHost.shared.bindSyncSender(nil)
         WhiteboardHost.shared.bindWriteAuthorizer(nil)
         WhiteboardHost.shared.bindAuthExpired(nil)
+        WhiteboardHost.shared.bindRoomMediaFeedback(nil)
         WhiteboardHost.shared.setLocalEditEnabled(false)
-        WhiteboardHost.shared.endSession()
-        let sdkRef = sdk
-        initQueue.async {
-            sdkRef.destroy()
+        Self.destroySdk(sdk)
+    }
+
+    private static func activateBackgroundAudio(_ allowed: Bool) {
+        guard allowed else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let session = AVAudioSession.sharedInstance()
+            try? session.setActive(true)
+        }
+    }
+
+    private static func destroySdk(_ retiringSdk:EduSdk) {
+        // destroy retires producers immediately and queues heavy teardown itself;
+        // do not put it behind an in-flight enterClassroom on initQueue.
+        // Keep the scoped native host until the SDK teardown job finishes.
+        retiringSdk.destroy {
+            DispatchQueue.main.async { WhiteboardHost.shared.endSession(ownedBy:retiringSdk) }
         }
     }
 
     private func bindSdkListeners(epoch: UInt64) {
+        let toolsQueue = queryQueue
+        let toolsGate = initEpoch
+        unsubs.append(sdk.onTeachingToolsUpdated { [weak self] json in
+            toolsQueue.async {
+                guard toolsGate.isCurrent(epoch) else { return }
+                do {
+                    let prepared = try TeachingToolsView.decode(json)
+                    Task { @MainActor [weak self] in
+                        guard let self, self.initEpoch.isCurrent(epoch) else { return }
+                        self.exportGate.replace(prepared.exports)
+                        self.toolsView = prepared
+                    }
+                } catch {
+                    Task { @MainActor [weak self] in
+                        guard let self, self.initEpoch.isCurrent(epoch) else { return }
+                        self.enqueueError(SdkError(code: .internal, message: error.localizedDescription))
+                    }
+                }
+            }
+        })
+        let presentationQueue = queryQueue
+        unsubs.append(sdk.onSdkSnapshot { [weak self] prepared in
+            presentationQueue.async {
+                let participants = prepared.classroomView.participants.map(ClassroomParticipant.init)
+                let teacher = prepared.classroomView.teacher.map(ClassroomParticipant.init)
+                Task { @MainActor in
+                    self?.runIfCurrent(epoch) {
+                        self?.snapshot.classroomView = prepared.classroomView
+                        self?.snapshot.continuation = prepared.continuation
+                        self?.snapshot.messages = prepared.classroomView.chatMessages
+                        if let continuation = prepared.continuation {
+                            self?.announceContinuationLimitations(continuation.limitations)
+                            Self.activateBackgroundAudio(continuation.playbackAllowed && continuation.returnEntry)
+                        }
+                        self?.snapshot.stageParticipants = participants
+                        self?.snapshot.featuredTeacher = teacher
+                    }
+                }
+            }
+        })
         unsubs.append(sdk.onJoinSuccess { [weak self] info in
             Task { @MainActor in
                 self?.runIfCurrent(epoch) {
@@ -647,6 +1124,9 @@ public final class ClassroomController: ObservableObject {
         })
         // 白板凭证由 Core 按后台 needWhiteboard 下发，与 IM、RTC 并发；
         // 不再等 onJoinSuccess，否则白板会被 IM 登录耗时拖住。
+        sdk.setWhiteboardSuspendHandler { scope,done in WhiteboardHost.shared.suspendCollaboration(mediaSessionId:scope,completion:done) }
+        // This is an OS cleanup capability, not a public event subscription.
+        // Keep it through leave/shutdown; EduSdk retires it after Core cleanup.
         unsubs.append(sdk.onWhiteboardCredentials { [weak self] credentials in
             Task { @MainActor in
                 self?.runIfCurrent(epoch) {
@@ -666,7 +1146,7 @@ public final class ClassroomController: ObservableObject {
             Task { @MainActor in
                 self?.runIfCurrent(epoch) {
                     guard let self else { return }
-                    Self.unbindWhiteboardSyncIfEnded(phase: info.phase)
+                    Self.unbindWhiteboardSyncIfTerminal(lifecycleStatus: info.lifecycleStatus)
                     let lifecycleStatus = info.lifecycleStatus
                     self.snapshot.phase = info.phase.rawValue
                     self.snapshot.lifecycleStatus = lifecycleStatus
@@ -686,6 +1166,7 @@ public final class ClassroomController: ObservableObject {
             Task { @MainActor in
                 self?.runIfCurrent(epoch) {
                     self?.snapshot.needLive = snap.needLive
+                    self?.snapshot.liveStreams = snap.liveStreams
                 }
             }
         })
@@ -708,16 +1189,32 @@ public final class ClassroomController: ObservableObject {
                 }
             }
         })
+        unsubs.append(sdk.onMyStageStatusChanged { [weak self] status in
+            Task { @MainActor in
+                self?.runIfCurrent(epoch) {
+                    guard let self else { return }
+                    self.snapshot.handRaised = status.handRaised ?? false
+                    self.refreshInteractionPolicy()
+                }
+            }
+        })
+        unsubs.append(sdk.onLocalScreenShareChanged { [weak self] sharing in
+            Task { @MainActor in
+                self?.runIfCurrent(epoch) {
+                    self?.snapshot.localScreenSharing = sharing
+                }
+            }
+        })
+        unsubs.append(sdk.onScreenShareUsersChanged { [weak self] users in
+            Task { @MainActor in
+                self?.runIfCurrent(epoch) {
+                    self?.snapshot.screenShareUserIds = users
+                }
+            }
+        })
         unsubs.append(sdk.onUserPermissionsChanged { [weak self] _ in
             guard let self else { return }
             self.refreshInteractionPolicy(notifyPermissionChanges: self.joinSucceeded)
-        })
-        unsubs.append(sdk.onImMessageReceived { [weak self] message in
-            Task { @MainActor in
-                self?.runIfCurrent(epoch) {
-                    self?.appendImMessage(message)
-                }
-            }
         })
         unsubs.append(sdk.onWhiteboardSyncReceived { [weak self] payloadJson in
             Task { @MainActor in
@@ -732,6 +1229,14 @@ public final class ClassroomController: ObservableObject {
         unsubs.append(sdk.onWhiteboardLiveStrokeReceived { payloadJson in
             guard liveStrokeGate.isCurrent(epoch) else { return }
             WhiteboardHost.shared.receiveWhiteboardLiveStroke(payloadJson)
+        })
+        unsubs.append(sdk.onWhiteboardMediaClock { payloadJson in
+            guard liveStrokeGate.isCurrent(epoch) else { return }
+            WhiteboardHost.shared.receiveMediaClock(payloadJson)
+        })
+        unsubs.append(sdk.onWhiteboardMediaReceived { payloadJson in
+            guard liveStrokeGate.isCurrent(epoch) else { return }
+            WhiteboardHost.shared.receiveWhiteboardMedia(payloadJson)
         })
         unsubs.append(sdk.onWhiteboardRecoveryRequested { [weak self] request in
             Task { @MainActor in
@@ -791,16 +1296,17 @@ public final class ClassroomController: ObservableObject {
 
     private func applyWhiteboardCredentials(_ credentials: WhiteboardCredentials?) {
         guard let credentials else {
+            WhiteboardHost.shared.bindRoomMediaSdk(nil,mediaSessionId:nil)
             WhiteboardHost.shared.applyJoinCredentials(nil)
             return
         }
+        WhiteboardHost.shared.bindRoomMediaSdk(sdk,mediaSessionId:credentials.mediaSessionId)
         WhiteboardHost.shared.applyJoinCredentials(WhiteboardConfig(
             roomId: credentials.roomId,
             appId: credentials.appId,
             userId: credentials.userId,
             token: credentials.token,
-            serverEnvironment: options.whiteboardServerEnvironment,
-            serverHost: options.whiteboardServerHost
+            serverHost: credentials.serverHost
         ))
     }
 
@@ -826,6 +1332,8 @@ public final class ClassroomController: ObservableObject {
         applyMediaOpenHint(sdk.mediaOpenHint())
         refreshMembers()
         startClassroomTimer()
+        // The first page belongs to Core onJoinSuccess, not SwiftUI appearance.
+        loadImMessageHistory()
     }
 
     private func applyMediaOpenHint(_ hint: MediaOpenHint) {
@@ -846,8 +1354,7 @@ public final class ClassroomController: ObservableObject {
         guard let id = mediaOpenHintFeedbackId else { return }
         mediaOpenHintFeedbackId = nil
         feedbackActionHandlers.removeValue(forKey: id)
-        feedbackQueue.removeAll { $0.id == id }
-        snapshot.feedback = feedbackQueue.first
+        feedbackPresenter.remove(id)
     }
 
     private func handleMediaOpenHintAction(_ actionId: String) {
@@ -878,6 +1385,7 @@ public final class ClassroomController: ObservableObject {
 
     private func startClassroomTimer() {
         stopClassroomTimer()
+        guard sdk.classroomView().runtime.mode == "active" else { return }
         refreshClassroomTimer()
         classroomTimer = Timer.scheduledTimer(withTimeInterval: Tokens.classroomTimerInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refreshClassroomTimer() }
@@ -890,6 +1398,7 @@ public final class ClassroomController: ObservableObject {
     }
 
     private func refreshClassroomTimer() {
+        guard sdk.classroomView().runtime.mode == "active" else { stopClassroomTimer(); return }
         guard joinSucceeded, !timerQueryInFlight else { return }
         timerQueryInFlight = true
         let sdkRef = sdk
@@ -925,9 +1434,8 @@ public final class ClassroomController: ObservableObject {
     private func clearClassroomStatusFeedback() {
         guard let id = classroomStatusFeedbackId else { return }
         feedbackActionHandlers.removeValue(forKey: id)
-        feedbackQueue.removeAll { $0.id == id }
+        feedbackPresenter.remove(id)
         classroomStatusFeedbackId = nil
-        snapshot.feedback = feedbackQueue.first
     }
 
     private func syncClassroomStatusFeedback() {
@@ -938,13 +1446,11 @@ public final class ClassroomController: ObservableObject {
         guard feedbackKey != lastClassroomFeedbackKey else { return }
         lastClassroomFeedbackKey = feedbackKey
         clearClassroomStatusFeedback()
-        guard let item = feedback(from: status, canStart: canStart, localeTag: options.localeTag) else { return }
+        let item = feedback(from: status, canStart: canStart, localeTag: options.localeTag)
         classroomStatusFeedbackId = item.id
-        feedbackActionHandlers[item.id] = { [weak self] actionId in
+        presentFeedback(item) { [weak self] actionId in
             if actionId == classroomStatusStartAction { self?.startClass() }
         }
-        feedbackQueue.append(item)
-        snapshot.feedback = feedbackQueue.first
     }
 
     private func clearListeners() {
@@ -1004,7 +1510,7 @@ public final class ClassroomController: ObservableObject {
                 guard let data = raw.data(using: .utf8),
                       let values = try JSONSerialization.jsonObject(with: data) as? [[String: Any]],
                       let availability = values.first(where: { ($0["action"] as? String) == action }) else {
-                    throw SdkError(code: .invalidState, message: EduI18n.text("feedbackOperationTitle"))
+                    throw SdkError(code: .invalidState, message: EduI18n.text("feedbackOperationFailed"))
                 }
                 guard (availability["available"] as? Bool) == true else {
                     let reason = availability["reason"] as? String ?? Tokens.reasonCapabilityNotReady
@@ -1018,7 +1524,7 @@ public final class ClassroomController: ObservableObject {
                     self.enqueueError(error as? SdkError ?? SdkError(
                         code: .internal,
                         message: error.localizedDescription.isEmpty
-                            ? EduI18n.text("feedbackOperationTitle")
+                            ? EduI18n.text("feedbackOperationFailed")
                             : error.localizedDescription
                     ))
                     completion()
@@ -1053,6 +1559,10 @@ public final class ClassroomController: ObservableObject {
     }
 
     private func refreshInteractionPolicy(notifyPermissionChanges: Bool = false) {
+        if !sdk.classroomView().runtime.canInspectDevices {
+            snapshot.deviceCheckOpen = false
+            stopClassroomTimer()
+        }
         policyQueryGeneration &+= 1
         let generation = policyQueryGeneration
         let epoch = initEpoch.current()
@@ -1063,7 +1573,7 @@ public final class ClassroomController: ObservableObject {
                 guard let self,
                       self.initEpoch.isCurrent(epoch),
                       self.policyQueryGeneration == generation else { return }
-                let previousDenied = self.snapshot.permissionDeniedActions
+                let previous = self.interactionPolicy
                 self.interactionPolicy = policy
                 let permissionDeniedActions = Set(policy.compactMap { item in
                     !item.available && item.reason == Tokens.permissionDeniedReason ? item.action : nil
@@ -1076,6 +1586,7 @@ public final class ClassroomController: ObservableObject {
                     $0.action == Tokens.actionEndClass && $0.available
                 }
                 self.snapshot.permissionDeniedActions = permissionDeniedActions
+                self.snapshot.toolbarEntries = toolbarEntries(policy)
                 let restrictionReason = editAvailability?.reason ?? Tokens.reasonCapabilityNotReady
                 self.writeGate.update(
                     allowed: editAvailability?.available == true,
@@ -1087,13 +1598,18 @@ public final class ClassroomController: ObservableObject {
                     canEditWhiteboard,
                     restrictionReason: restrictionReason
                 )
-                if notifyPermissionChanges {
-                    let revoked = permissionDeniedActions.subtracting(previousDenied)
-                    let granted = previousDenied.subtracting(permissionDeniedActions)
+                WhiteboardHost.shared.syncCoursewareMediaPublisher()
+                if notifyPermissionChanges && !previous.isEmpty {
+                    let revoked = Tokens.permissionToastActions.filter { action in
+                        Tokens.policyAllows(previous, action) && Tokens.policyDenies(policy, action)
+                    }
+                    let granted = Tokens.permissionToastActions.filter { action in
+                        Tokens.policyDenies(previous, action) && Tokens.policyAllows(policy, action)
+                    }
                     let changed = revoked.isEmpty ? granted : revoked
                     if !changed.isEmpty {
                         self.presentFeedback(permissionChangedFeedback(
-                            actions: changed.map(self.permissionActionLabel),
+                            actions: changed.map { classroomActionLabel($0, localeTag: self.options.localeTag) },
                             allowed: revoked.isEmpty,
                             localeTag: self.options.localeTag
                         ))
@@ -1122,24 +1638,13 @@ public final class ClassroomController: ObservableObject {
         return userId == options.userId || userId == joinLocalUserId
     }
 
-    private func permissionActionLabel(_ action: String) -> String {
-        let key: String
-        switch action {
-        case Tokens.actionSendMessage: key = "classroomActionChat"
-        case Tokens.actionUseMicrophone: key = "classroomActionMicrophone"
-        case Tokens.actionUseCamera: key = "classroomActionCamera"
-        case Tokens.actionEditWhiteboard: key = "classroomActionWhiteboard"
-        case Tokens.actionShareScreen: key = "classroomActionScreenShare"
-        default: key = "feedbackOperationTitle"
-        }
-        return EduI18n.text(key, localeTag: options.localeTag)
-    }
-
-    private static func makeSdk(options: EduClassroomOptions) -> EduSdk {
+    private static func makeSdk(options: EduClassroomOptions, continuation: ClassroomContinuationBinding?) -> EduSdk {
         EduSdk.create(options: EduSdkCreateOptions(
             appId: options.appId,
             backendUrl: options.backendUrl,
-            userToken: options.userToken.isEmpty ? nil : options.userToken
+            userToken: options.userToken.isEmpty ? nil : options.userToken,
+            continuation: continuation.map { binding in { try binding.configure() } },
+            continuationEnvironment: continuation.map { binding in { report in try binding.subscribe(report) } }
         ))
     }
 
@@ -1155,7 +1660,6 @@ public final class ClassroomController: ObservableObject {
     private enum Tokens {
         static let initQueueLabel = "edusdk.classroom.init"
         static let queryQueueLabel = "edusdk.classroom.query"
-        static let errorDedupWindow: TimeInterval = 0.3
         static let classroomTimerInterval: TimeInterval = 1
         static let actionStartClass = "start_class"
         static let actionEndClass = "end_class"
@@ -1164,7 +1668,20 @@ public final class ClassroomController: ObservableObject {
         static let actionUseMicrophone = "use_microphone"
         static let actionUseCamera = "use_camera"
         static let actionShareScreen = "share_screen"
+        static let actionRaiseHand = "raise_hand"
         static let permissionDeniedReason = "permission_denied"
+        static let toastAutoDismissMs: UInt64 = 3000
+        static let permissionToastActions = [
+            actionSendMessage, actionUseMicrophone, actionUseCamera, actionEditWhiteboard, actionShareScreen,
+        ]
+
+        static func policyDenies(_ policy: [ActionAvailability], _ action: String) -> Bool {
+            policy.contains { $0.action == action && !$0.available && $0.reason == permissionDeniedReason }
+        }
+
+        static func policyAllows(_ policy: [ActionAvailability], _ action: String) -> Bool {
+            policy.contains { $0.action == action && $0.available }
+        }
         static let reasonCapabilityNotReady = "capability_not_ready"
         static let errorDomain = "EduSDKUI"
         static let errorCodeCoursewareLoadFailed = 1

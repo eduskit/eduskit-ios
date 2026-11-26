@@ -416,6 +416,22 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterInt32: FfiConverterPrimitive {
+    typealias FfiType = Int32
+    typealias SwiftType = Int32
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int32, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
     typealias FfiType = UInt64
     typealias SwiftType = UInt64
@@ -425,6 +441,22 @@ fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
     }
 
     public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
+    typealias FfiType = Int64
+    typealias SwiftType = Int64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int64, into buf: inout [UInt8]) {
         writeInt(&buf, lower(value))
     }
 }
@@ -513,7 +545,14 @@ public protocol EdusdkClientProtocol: AnyObject, Sendable {
     
     func backendSnapshot() throws  -> BackendSnapshot
     
+    /**
+     * Begin Core cleanup. The host continues executing returned effects until shutdown_complete.
+     */
+    func beginShutdown() throws 
+    
     func classroomTimer() throws  -> ClassroomTimerSnapshot
+    
+    func classroomViewJson() throws  -> String
     
     /**
      * 宿主执行完副作用后必须回传结果，Core 才提交对应状态。
@@ -547,6 +586,8 @@ public protocol EdusdkClientProtocol: AnyObject, Sendable {
     
     func grantWhiteboardPermission(userId: String) throws 
     
+    func imHistoryJson() throws  -> String
+    
     func imMessages() throws  -> [ImMessageSnapshot]
     
     func `init`(config: InitConfig) throws 
@@ -560,6 +601,8 @@ public protocol EdusdkClientProtocol: AnyObject, Sendable {
     func leaveRoom() throws 
     
     func liftAllMessageMute() throws 
+    
+    func loadImMessageHistory(cursor: String?, limit: UInt32) throws 
     
     func loadMemberPermissions(userId: String) throws 
     
@@ -577,20 +620,12 @@ public protocol EdusdkClientProtocol: AnyObject, Sendable {
     
     func muteVideo(muted: Bool) throws 
     
-    func pollEvents() throws  -> [Event]
-    
     /**
-     * 返回 Core 编排的原子副作用 JSON。平台只负责执行，不得自行拼业务流程。
+     * The only Mobile queue consumer. Native clocks are capabilities, not Core policy.
      */
-    func pollHostEffects() throws  -> [String]
+    func pollRuntimeUpdate(forceSnapshot: Bool) throws  -> MobileRuntimeUpdate
     
-    /**
-     * 遥测副作用队列，与业务副作用完全分开。
-     *
-     * 合到 `poll_host_effects` 里的话，上报会排进进课的执行顺序、占用其域线程，
-     * 而遥测本该完全让路。任何解析失败都当作「没有遥测」，绝不冒泡到业务。
-     */
-    func pollTelemetryEffects()  -> [String]
+    func prepareTeachingToolAuthoring(requestJson: String) throws  -> String
     
     func promptUserOpenCamera(userId: String) throws 
     
@@ -599,6 +634,12 @@ public protocol EdusdkClientProtocol: AnyObject, Sendable {
     func rejectUserOnStage(userId: String) throws 
     
     func removeUserFromStage(userId: String) throws 
+    
+    func requestClassroomContinuation(requestJson: String) throws 
+    
+    func requestTeachingTools(requestJson: String) throws 
+    
+    func requestWhiteboardMediaProgram(requestJson: String) throws 
     
     func revokeAllMessagePermission() throws 
     
@@ -618,17 +659,36 @@ public protocol EdusdkClientProtocol: AnyObject, Sendable {
     
     func sendWhiteboardLiveStroke(payloadJson: String) throws 
     
+    func sendWhiteboardMedia(payloadJson: String) throws 
+    
     func sendWhiteboardSync(payloadJson: String) throws 
     
+    /**
+     * Release the native owner after the Core cleanup turn has completed.
+     */
     func shutdown() throws 
     
     func startClass() throws 
+    
+    /**
+     * 开始屏幕共享。Core 校验「已上台 + 有 screen_share 权限」后下发采集指令，
+     * 实际推流状态以 `LocalScreenShareChanged` 事件为准。
+     */
+    func startScreenShare() throws 
+    
+    func stopScreenShare() throws 
     
     func userCancelHand() throws 
     
     func userLeaveStage() throws 
     
     func userRaiseHand() throws 
+    
+    /**
+     * Native cleanup capability; caller uses the serial SDK worker and drains
+     * its next runtime turn. Generation ownership applies through shutdown.
+     */
+    func whiteboardMediaCleanup(requestJson: String) throws  -> String
     
 }
 open class EdusdkClient: EdusdkClientProtocol, @unchecked Sendable {
@@ -725,9 +785,25 @@ open func backendSnapshot()throws  -> BackendSnapshot  {
 })
 }
     
+    /**
+     * Begin Core cleanup. The host continues executing returned effects until shutdown_complete.
+     */
+open func beginShutdown()throws   {try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
+    uniffi_edusdk_headless_fn_method_edusdkclient_begin_shutdown(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
 open func classroomTimer()throws  -> ClassroomTimerSnapshot  {
     return try  FfiConverterTypeClassroomTimerSnapshot_lift(try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
     uniffi_edusdk_headless_fn_method_edusdkclient_classroom_timer(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func classroomViewJson()throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
+    uniffi_edusdk_headless_fn_method_edusdkclient_classroom_view_json(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -811,6 +887,13 @@ open func grantWhiteboardPermission(userId: String)throws   {try rustCallWithErr
 }
 }
     
+open func imHistoryJson()throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
+    uniffi_edusdk_headless_fn_method_edusdkclient_im_history_json(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func imMessages()throws  -> [ImMessageSnapshot]  {
     return try  FfiConverterSequenceTypeImMessageSnapshot.lift(try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
     uniffi_edusdk_headless_fn_method_edusdkclient_im_messages(self.uniffiClonePointer(),$0
@@ -856,6 +939,14 @@ open func leaveRoom()throws   {try rustCallWithError(FfiConverterTypeEdusdkError
     
 open func liftAllMessageMute()throws   {try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
     uniffi_edusdk_headless_fn_method_edusdkclient_lift_all_message_mute(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func loadImMessageHistory(cursor: String?, limit: UInt32)throws   {try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
+    uniffi_edusdk_headless_fn_method_edusdkclient_load_im_message_history(self.uniffiClonePointer(),
+        FfiConverterOptionString.lower(cursor),
+        FfiConverterUInt32.lower(limit),$0
     )
 }
 }
@@ -917,32 +1008,21 @@ open func muteVideo(muted: Bool)throws   {try rustCallWithError(FfiConverterType
 }
 }
     
-open func pollEvents()throws  -> [Event]  {
-    return try  FfiConverterSequenceTypeEvent.lift(try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
-    uniffi_edusdk_headless_fn_method_edusdkclient_poll_events(self.uniffiClonePointer(),$0
+    /**
+     * The only Mobile queue consumer. Native clocks are capabilities, not Core policy.
+     */
+open func pollRuntimeUpdate(forceSnapshot: Bool)throws  -> MobileRuntimeUpdate  {
+    return try  FfiConverterTypeMobileRuntimeUpdate_lift(try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
+    uniffi_edusdk_headless_fn_method_edusdkclient_poll_runtime_update(self.uniffiClonePointer(),
+        FfiConverterBool.lower(forceSnapshot),$0
     )
 })
 }
     
-    /**
-     * 返回 Core 编排的原子副作用 JSON。平台只负责执行，不得自行拼业务流程。
-     */
-open func pollHostEffects()throws  -> [String]  {
-    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
-    uniffi_edusdk_headless_fn_method_edusdkclient_poll_host_effects(self.uniffiClonePointer(),$0
-    )
-})
-}
-    
-    /**
-     * 遥测副作用队列，与业务副作用完全分开。
-     *
-     * 合到 `poll_host_effects` 里的话，上报会排进进课的执行顺序、占用其域线程，
-     * 而遥测本该完全让路。任何解析失败都当作「没有遥测」，绝不冒泡到业务。
-     */
-open func pollTelemetryEffects() -> [String]  {
-    return try!  FfiConverterSequenceString.lift(try! rustCall() {
-    uniffi_edusdk_headless_fn_method_edusdkclient_poll_telemetry_effects(self.uniffiClonePointer(),$0
+open func prepareTeachingToolAuthoring(requestJson: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
+    uniffi_edusdk_headless_fn_method_edusdkclient_prepare_teaching_tool_authoring(self.uniffiClonePointer(),
+        FfiConverterString.lower(requestJson),$0
     )
 })
 }
@@ -971,6 +1051,27 @@ open func rejectUserOnStage(userId: String)throws   {try rustCallWithError(FfiCo
 open func removeUserFromStage(userId: String)throws   {try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
     uniffi_edusdk_headless_fn_method_edusdkclient_remove_user_from_stage(self.uniffiClonePointer(),
         FfiConverterString.lower(userId),$0
+    )
+}
+}
+    
+open func requestClassroomContinuation(requestJson: String)throws   {try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
+    uniffi_edusdk_headless_fn_method_edusdkclient_request_classroom_continuation(self.uniffiClonePointer(),
+        FfiConverterString.lower(requestJson),$0
+    )
+}
+}
+    
+open func requestTeachingTools(requestJson: String)throws   {try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
+    uniffi_edusdk_headless_fn_method_edusdkclient_request_teaching_tools(self.uniffiClonePointer(),
+        FfiConverterString.lower(requestJson),$0
+    )
+}
+}
+    
+open func requestWhiteboardMediaProgram(requestJson: String)throws   {try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
+    uniffi_edusdk_headless_fn_method_edusdkclient_request_whiteboard_media_program(self.uniffiClonePointer(),
+        FfiConverterString.lower(requestJson),$0
     )
 }
 }
@@ -1037,6 +1138,13 @@ open func sendWhiteboardLiveStroke(payloadJson: String)throws   {try rustCallWit
 }
 }
     
+open func sendWhiteboardMedia(payloadJson: String)throws   {try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
+    uniffi_edusdk_headless_fn_method_edusdkclient_send_whiteboard_media(self.uniffiClonePointer(),
+        FfiConverterString.lower(payloadJson),$0
+    )
+}
+}
+    
 open func sendWhiteboardSync(payloadJson: String)throws   {try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
     uniffi_edusdk_headless_fn_method_edusdkclient_send_whiteboard_sync(self.uniffiClonePointer(),
         FfiConverterString.lower(payloadJson),$0
@@ -1044,6 +1152,9 @@ open func sendWhiteboardSync(payloadJson: String)throws   {try rustCallWithError
 }
 }
     
+    /**
+     * Release the native owner after the Core cleanup turn has completed.
+     */
 open func shutdown()throws   {try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
     uniffi_edusdk_headless_fn_method_edusdkclient_shutdown(self.uniffiClonePointer(),$0
     )
@@ -1052,6 +1163,22 @@ open func shutdown()throws   {try rustCallWithError(FfiConverterTypeEdusdkError_
     
 open func startClass()throws   {try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
     uniffi_edusdk_headless_fn_method_edusdkclient_start_class(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+    /**
+     * 开始屏幕共享。Core 校验「已上台 + 有 screen_share 权限」后下发采集指令，
+     * 实际推流状态以 `LocalScreenShareChanged` 事件为准。
+     */
+open func startScreenShare()throws   {try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
+    uniffi_edusdk_headless_fn_method_edusdkclient_start_screen_share(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func stopScreenShare()throws   {try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
+    uniffi_edusdk_headless_fn_method_edusdkclient_stop_screen_share(self.uniffiClonePointer(),$0
     )
 }
 }
@@ -1072,6 +1199,18 @@ open func userRaiseHand()throws   {try rustCallWithError(FfiConverterTypeEdusdkE
     uniffi_edusdk_headless_fn_method_edusdkclient_user_raise_hand(self.uniffiClonePointer(),$0
     )
 }
+}
+    
+    /**
+     * Native cleanup capability; caller uses the serial SDK worker and drains
+     * its next runtime turn. Generation ownership applies through shutdown.
+     */
+open func whiteboardMediaCleanup(requestJson: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeEdusdkError_lift) {
+    uniffi_edusdk_headless_fn_method_edusdkclient_whiteboard_media_cleanup(self.uniffiClonePointer(),
+        FfiConverterString.lower(requestJson),$0
+    )
+})
 }
     
 
@@ -1148,6 +1287,15 @@ public struct BackendSnapshot {
     public var members: [ClassroomMemberSnapshot]
     public var memberCount: UInt32
     public var membersNextCursor: String?
+    public var toolsJson: String?
+    /**
+     * 台下该播哪几路。台上为空，画面走 RTC
+     */
+    public var liveStreams: [LiveStreamSnapshot]
+    /**
+     * 与 `classroom.live_relay_changed` 对齐的集合版本
+     */
+    public var liveRelayVersion: Int64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -1157,7 +1305,13 @@ public struct BackendSnapshot {
          */classroomTitle: String?, 
         /**
          * 进行中且本人未上台：不进 RTC，改拉台上直播流。
-         */needLive: Bool, members: [ClassroomMemberSnapshot], memberCount: UInt32, membersNextCursor: String?) {
+         */needLive: Bool, members: [ClassroomMemberSnapshot], memberCount: UInt32, membersNextCursor: String?, toolsJson: String?, 
+        /**
+         * 台下该播哪几路。台上为空，画面走 RTC
+         */liveStreams: [LiveStreamSnapshot], 
+        /**
+         * 与 `classroom.live_relay_changed` 对齐的集合版本
+         */liveRelayVersion: Int64) {
         self.classroomId = classroomId
         self.classPhase = classPhase
         self.lifecycleStatus = lifecycleStatus
@@ -1169,6 +1323,9 @@ public struct BackendSnapshot {
         self.members = members
         self.memberCount = memberCount
         self.membersNextCursor = membersNextCursor
+        self.toolsJson = toolsJson
+        self.liveStreams = liveStreams
+        self.liveRelayVersion = liveRelayVersion
     }
 }
 
@@ -1212,6 +1369,15 @@ extension BackendSnapshot: Equatable, Hashable {
         if lhs.membersNextCursor != rhs.membersNextCursor {
             return false
         }
+        if lhs.toolsJson != rhs.toolsJson {
+            return false
+        }
+        if lhs.liveStreams != rhs.liveStreams {
+            return false
+        }
+        if lhs.liveRelayVersion != rhs.liveRelayVersion {
+            return false
+        }
         return true
     }
 
@@ -1227,6 +1393,9 @@ extension BackendSnapshot: Equatable, Hashable {
         hasher.combine(members)
         hasher.combine(memberCount)
         hasher.combine(membersNextCursor)
+        hasher.combine(toolsJson)
+        hasher.combine(liveStreams)
+        hasher.combine(liveRelayVersion)
     }
 }
 
@@ -1249,7 +1418,10 @@ public struct FfiConverterTypeBackendSnapshot: FfiConverterRustBuffer {
                 needLive: FfiConverterBool.read(from: &buf), 
                 members: FfiConverterSequenceTypeClassroomMemberSnapshot.read(from: &buf), 
                 memberCount: FfiConverterUInt32.read(from: &buf), 
-                membersNextCursor: FfiConverterOptionString.read(from: &buf)
+                membersNextCursor: FfiConverterOptionString.read(from: &buf), 
+                toolsJson: FfiConverterOptionString.read(from: &buf), 
+                liveStreams: FfiConverterSequenceTypeLiveStreamSnapshot.read(from: &buf), 
+                liveRelayVersion: FfiConverterInt64.read(from: &buf)
         )
     }
 
@@ -1265,6 +1437,9 @@ public struct FfiConverterTypeBackendSnapshot: FfiConverterRustBuffer {
         FfiConverterSequenceTypeClassroomMemberSnapshot.write(value.members, into: &buf)
         FfiConverterUInt32.write(value.memberCount, into: &buf)
         FfiConverterOptionString.write(value.membersNextCursor, into: &buf)
+        FfiConverterOptionString.write(value.toolsJson, into: &buf)
+        FfiConverterSequenceTypeLiveStreamSnapshot.write(value.liveStreams, into: &buf)
+        FfiConverterInt64.write(value.liveRelayVersion, into: &buf)
     }
 }
 
@@ -1776,6 +1951,10 @@ public struct InitConfig {
     public var platform: String?
     public var sdkVersion: String?
     public var appVersion: String?
+    /**
+     * 本端播放器是否支持快直播（`webrtc://`）。不支持时 Core 自动回落 FLV。
+     */
+    public var liveSupportsLeb: Bool?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -1788,7 +1967,10 @@ public struct InitConfig {
          */deviceId: String? = nil, 
         /**
          * 取值见 schema/telemetry.yaml 的 enums.platform。
-         */platform: String? = nil, sdkVersion: String? = nil, appVersion: String? = nil) {
+         */platform: String? = nil, sdkVersion: String? = nil, appVersion: String? = nil, 
+        /**
+         * 本端播放器是否支持快直播（`webrtc://`）。不支持时 Core 自动回落 FLV。
+         */liveSupportsLeb: Bool? = nil) {
         self.appId = appId
         self.backendBaseUrl = backendBaseUrl
         self.rtcProvider = rtcProvider
@@ -1800,6 +1982,7 @@ public struct InitConfig {
         self.platform = platform
         self.sdkVersion = sdkVersion
         self.appVersion = appVersion
+        self.liveSupportsLeb = liveSupportsLeb
     }
 }
 
@@ -1843,6 +2026,9 @@ extension InitConfig: Equatable, Hashable {
         if lhs.appVersion != rhs.appVersion {
             return false
         }
+        if lhs.liveSupportsLeb != rhs.liveSupportsLeb {
+            return false
+        }
         return true
     }
 
@@ -1858,6 +2044,7 @@ extension InitConfig: Equatable, Hashable {
         hasher.combine(platform)
         hasher.combine(sdkVersion)
         hasher.combine(appVersion)
+        hasher.combine(liveSupportsLeb)
     }
 }
 
@@ -1880,7 +2067,8 @@ public struct FfiConverterTypeInitConfig: FfiConverterRustBuffer {
                 deviceId: FfiConverterOptionString.read(from: &buf), 
                 platform: FfiConverterOptionString.read(from: &buf), 
                 sdkVersion: FfiConverterOptionString.read(from: &buf), 
-                appVersion: FfiConverterOptionString.read(from: &buf)
+                appVersion: FfiConverterOptionString.read(from: &buf), 
+                liveSupportsLeb: FfiConverterOptionBool.read(from: &buf)
         )
     }
 
@@ -1896,6 +2084,7 @@ public struct FfiConverterTypeInitConfig: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.platform, into: &buf)
         FfiConverterOptionString.write(value.sdkVersion, into: &buf)
         FfiConverterOptionString.write(value.appVersion, into: &buf)
+        FfiConverterOptionBool.write(value.liveSupportsLeb, into: &buf)
     }
 }
 
@@ -1915,6 +2104,332 @@ public func FfiConverterTypeInitConfig_lower(_ value: InitConfig) -> RustBuffer 
 }
 
 
+/**
+ * 一路台下可播流。`url` 已按本端能力挑好协议，宿主直接喂给播放器。
+ */
+public struct LiveStreamSnapshot {
+    public var streamName: String
+    public var publisherUserId: String
+    /**
+     * main / aux / audio
+     */
+    public var streamType: String
+    public var url: String
+    /**
+     * 混音模式下视频路静音，声音走 audio 路
+     */
+    public var muted: Bool
+    public var expiresAt: String
+    public var playing: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(streamName: String, publisherUserId: String, 
+        /**
+         * main / aux / audio
+         */streamType: String, url: String, 
+        /**
+         * 混音模式下视频路静音，声音走 audio 路
+         */muted: Bool, expiresAt: String, playing: Bool) {
+        self.streamName = streamName
+        self.publisherUserId = publisherUserId
+        self.streamType = streamType
+        self.url = url
+        self.muted = muted
+        self.expiresAt = expiresAt
+        self.playing = playing
+    }
+}
+
+#if compiler(>=6)
+extension LiveStreamSnapshot: Sendable {}
+#endif
+
+
+extension LiveStreamSnapshot: Equatable, Hashable {
+    public static func ==(lhs: LiveStreamSnapshot, rhs: LiveStreamSnapshot) -> Bool {
+        if lhs.streamName != rhs.streamName {
+            return false
+        }
+        if lhs.publisherUserId != rhs.publisherUserId {
+            return false
+        }
+        if lhs.streamType != rhs.streamType {
+            return false
+        }
+        if lhs.url != rhs.url {
+            return false
+        }
+        if lhs.muted != rhs.muted {
+            return false
+        }
+        if lhs.expiresAt != rhs.expiresAt {
+            return false
+        }
+        if lhs.playing != rhs.playing {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(streamName)
+        hasher.combine(publisherUserId)
+        hasher.combine(streamType)
+        hasher.combine(url)
+        hasher.combine(muted)
+        hasher.combine(expiresAt)
+        hasher.combine(playing)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLiveStreamSnapshot: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LiveStreamSnapshot {
+        return
+            try LiveStreamSnapshot(
+                streamName: FfiConverterString.read(from: &buf), 
+                publisherUserId: FfiConverterString.read(from: &buf), 
+                streamType: FfiConverterString.read(from: &buf), 
+                url: FfiConverterString.read(from: &buf), 
+                muted: FfiConverterBool.read(from: &buf), 
+                expiresAt: FfiConverterString.read(from: &buf), 
+                playing: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LiveStreamSnapshot, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.streamName, into: &buf)
+        FfiConverterString.write(value.publisherUserId, into: &buf)
+        FfiConverterString.write(value.streamType, into: &buf)
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterBool.write(value.muted, into: &buf)
+        FfiConverterString.write(value.expiresAt, into: &buf)
+        FfiConverterBool.write(value.playing, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLiveStreamSnapshot_lift(_ buf: RustBuffer) throws -> LiveStreamSnapshot {
+    return try FfiConverterTypeLiveStreamSnapshot.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLiveStreamSnapshot_lower(_ value: LiveStreamSnapshot) -> RustBuffer {
+    return FfiConverterTypeLiveStreamSnapshot.lower(value)
+}
+
+
+/**
+ * One atomic Core update. Optional projections are absent when their inputs did not change.
+ */
+public struct MobileRuntimeUpdate {
+    public var epoch: UInt64
+    public var revision: UInt64
+    public var events: [Event]
+    public var hostEffects: [String]
+    public var telemetryEffects: [String]
+    public var backendSnapshot: BackendSnapshot?
+    public var roomState: RoomState?
+    public var classroomTimer: ClassroomTimerSnapshot?
+    public var interactionPolicyJson: String?
+    public var classroomViewJson: String?
+    public var mediaOpenHintJson: String?
+    public var continuationJson: String?
+    public var imMessages: [ImMessageSnapshot]?
+    public var imHistoryJson: String?
+    public var nextWakeDelayMs: UInt64?
+    public var hasMoreWork: Bool
+    public var shutdownComplete: Bool
+    public var shutdownTimedOut: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(epoch: UInt64, revision: UInt64, events: [Event], hostEffects: [String], telemetryEffects: [String], backendSnapshot: BackendSnapshot?, roomState: RoomState?, classroomTimer: ClassroomTimerSnapshot?, interactionPolicyJson: String?, classroomViewJson: String?, mediaOpenHintJson: String?, continuationJson: String?, imMessages: [ImMessageSnapshot]?, imHistoryJson: String?, nextWakeDelayMs: UInt64?, hasMoreWork: Bool, shutdownComplete: Bool, shutdownTimedOut: Bool) {
+        self.epoch = epoch
+        self.revision = revision
+        self.events = events
+        self.hostEffects = hostEffects
+        self.telemetryEffects = telemetryEffects
+        self.backendSnapshot = backendSnapshot
+        self.roomState = roomState
+        self.classroomTimer = classroomTimer
+        self.interactionPolicyJson = interactionPolicyJson
+        self.classroomViewJson = classroomViewJson
+        self.mediaOpenHintJson = mediaOpenHintJson
+        self.continuationJson = continuationJson
+        self.imMessages = imMessages
+        self.imHistoryJson = imHistoryJson
+        self.nextWakeDelayMs = nextWakeDelayMs
+        self.hasMoreWork = hasMoreWork
+        self.shutdownComplete = shutdownComplete
+        self.shutdownTimedOut = shutdownTimedOut
+    }
+}
+
+#if compiler(>=6)
+extension MobileRuntimeUpdate: Sendable {}
+#endif
+
+
+extension MobileRuntimeUpdate: Equatable, Hashable {
+    public static func ==(lhs: MobileRuntimeUpdate, rhs: MobileRuntimeUpdate) -> Bool {
+        if lhs.epoch != rhs.epoch {
+            return false
+        }
+        if lhs.revision != rhs.revision {
+            return false
+        }
+        if lhs.events != rhs.events {
+            return false
+        }
+        if lhs.hostEffects != rhs.hostEffects {
+            return false
+        }
+        if lhs.telemetryEffects != rhs.telemetryEffects {
+            return false
+        }
+        if lhs.backendSnapshot != rhs.backendSnapshot {
+            return false
+        }
+        if lhs.roomState != rhs.roomState {
+            return false
+        }
+        if lhs.classroomTimer != rhs.classroomTimer {
+            return false
+        }
+        if lhs.interactionPolicyJson != rhs.interactionPolicyJson {
+            return false
+        }
+        if lhs.classroomViewJson != rhs.classroomViewJson {
+            return false
+        }
+        if lhs.mediaOpenHintJson != rhs.mediaOpenHintJson {
+            return false
+        }
+        if lhs.continuationJson != rhs.continuationJson {
+            return false
+        }
+        if lhs.imMessages != rhs.imMessages {
+            return false
+        }
+        if lhs.imHistoryJson != rhs.imHistoryJson {
+            return false
+        }
+        if lhs.nextWakeDelayMs != rhs.nextWakeDelayMs {
+            return false
+        }
+        if lhs.hasMoreWork != rhs.hasMoreWork {
+            return false
+        }
+        if lhs.shutdownComplete != rhs.shutdownComplete {
+            return false
+        }
+        if lhs.shutdownTimedOut != rhs.shutdownTimedOut {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(epoch)
+        hasher.combine(revision)
+        hasher.combine(events)
+        hasher.combine(hostEffects)
+        hasher.combine(telemetryEffects)
+        hasher.combine(backendSnapshot)
+        hasher.combine(roomState)
+        hasher.combine(classroomTimer)
+        hasher.combine(interactionPolicyJson)
+        hasher.combine(classroomViewJson)
+        hasher.combine(mediaOpenHintJson)
+        hasher.combine(continuationJson)
+        hasher.combine(imMessages)
+        hasher.combine(imHistoryJson)
+        hasher.combine(nextWakeDelayMs)
+        hasher.combine(hasMoreWork)
+        hasher.combine(shutdownComplete)
+        hasher.combine(shutdownTimedOut)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMobileRuntimeUpdate: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MobileRuntimeUpdate {
+        return
+            try MobileRuntimeUpdate(
+                epoch: FfiConverterUInt64.read(from: &buf), 
+                revision: FfiConverterUInt64.read(from: &buf), 
+                events: FfiConverterSequenceTypeEvent.read(from: &buf), 
+                hostEffects: FfiConverterSequenceString.read(from: &buf), 
+                telemetryEffects: FfiConverterSequenceString.read(from: &buf), 
+                backendSnapshot: FfiConverterOptionTypeBackendSnapshot.read(from: &buf), 
+                roomState: FfiConverterOptionTypeRoomState.read(from: &buf), 
+                classroomTimer: FfiConverterOptionTypeClassroomTimerSnapshot.read(from: &buf), 
+                interactionPolicyJson: FfiConverterOptionString.read(from: &buf), 
+                classroomViewJson: FfiConverterOptionString.read(from: &buf), 
+                mediaOpenHintJson: FfiConverterOptionString.read(from: &buf), 
+                continuationJson: FfiConverterOptionString.read(from: &buf), 
+                imMessages: FfiConverterOptionSequenceTypeImMessageSnapshot.read(from: &buf), 
+                imHistoryJson: FfiConverterOptionString.read(from: &buf), 
+                nextWakeDelayMs: FfiConverterOptionUInt64.read(from: &buf), 
+                hasMoreWork: FfiConverterBool.read(from: &buf), 
+                shutdownComplete: FfiConverterBool.read(from: &buf), 
+                shutdownTimedOut: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MobileRuntimeUpdate, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.epoch, into: &buf)
+        FfiConverterUInt64.write(value.revision, into: &buf)
+        FfiConverterSequenceTypeEvent.write(value.events, into: &buf)
+        FfiConverterSequenceString.write(value.hostEffects, into: &buf)
+        FfiConverterSequenceString.write(value.telemetryEffects, into: &buf)
+        FfiConverterOptionTypeBackendSnapshot.write(value.backendSnapshot, into: &buf)
+        FfiConverterOptionTypeRoomState.write(value.roomState, into: &buf)
+        FfiConverterOptionTypeClassroomTimerSnapshot.write(value.classroomTimer, into: &buf)
+        FfiConverterOptionString.write(value.interactionPolicyJson, into: &buf)
+        FfiConverterOptionString.write(value.classroomViewJson, into: &buf)
+        FfiConverterOptionString.write(value.mediaOpenHintJson, into: &buf)
+        FfiConverterOptionString.write(value.continuationJson, into: &buf)
+        FfiConverterOptionSequenceTypeImMessageSnapshot.write(value.imMessages, into: &buf)
+        FfiConverterOptionString.write(value.imHistoryJson, into: &buf)
+        FfiConverterOptionUInt64.write(value.nextWakeDelayMs, into: &buf)
+        FfiConverterBool.write(value.hasMoreWork, into: &buf)
+        FfiConverterBool.write(value.shutdownComplete, into: &buf)
+        FfiConverterBool.write(value.shutdownTimedOut, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMobileRuntimeUpdate_lift(_ buf: RustBuffer) throws -> MobileRuntimeUpdate {
+    return try FfiConverterTypeMobileRuntimeUpdate.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMobileRuntimeUpdate_lower(_ value: MobileRuntimeUpdate) -> RustBuffer {
+    return FfiConverterTypeMobileRuntimeUpdate.lower(value)
+}
+
+
 public struct RoomState {
     public var roomId: String?
     public var phase: RoomPhase
@@ -1928,6 +2443,14 @@ public struct RoomState {
      * Core 判定的本地预览是否可绑；宿主不得自行对 `local_video_muted` 取反。
      */
     public var localVideoBindable: Bool
+    /**
+     * 本端是否正在推屏幕共享辅流；以 Vendor 采集回执为准。
+     */
+    public var localScreenSharing: Bool
+    /**
+     * Core 判定的可绑远端屏幕共享用户，语义同 `bindable_remote_video_user_ids`。
+     */
+    public var bindableRemoteScreenUserIds: [String]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -1937,13 +2460,21 @@ public struct RoomState {
          */bindableRemoteVideoUserIds: [String], 
         /**
          * Core 判定的本地预览是否可绑；宿主不得自行对 `local_video_muted` 取反。
-         */localVideoBindable: Bool) {
+         */localVideoBindable: Bool, 
+        /**
+         * 本端是否正在推屏幕共享辅流；以 Vendor 采集回执为准。
+         */localScreenSharing: Bool, 
+        /**
+         * Core 判定的可绑远端屏幕共享用户，语义同 `bindable_remote_video_user_ids`。
+         */bindableRemoteScreenUserIds: [String]) {
         self.roomId = roomId
         self.phase = phase
         self.localAudioMuted = localAudioMuted
         self.localVideoMuted = localVideoMuted
         self.bindableRemoteVideoUserIds = bindableRemoteVideoUserIds
         self.localVideoBindable = localVideoBindable
+        self.localScreenSharing = localScreenSharing
+        self.bindableRemoteScreenUserIds = bindableRemoteScreenUserIds
     }
 }
 
@@ -1972,6 +2503,12 @@ extension RoomState: Equatable, Hashable {
         if lhs.localVideoBindable != rhs.localVideoBindable {
             return false
         }
+        if lhs.localScreenSharing != rhs.localScreenSharing {
+            return false
+        }
+        if lhs.bindableRemoteScreenUserIds != rhs.bindableRemoteScreenUserIds {
+            return false
+        }
         return true
     }
 
@@ -1982,6 +2519,8 @@ extension RoomState: Equatable, Hashable {
         hasher.combine(localVideoMuted)
         hasher.combine(bindableRemoteVideoUserIds)
         hasher.combine(localVideoBindable)
+        hasher.combine(localScreenSharing)
+        hasher.combine(bindableRemoteScreenUserIds)
     }
 }
 
@@ -1999,7 +2538,9 @@ public struct FfiConverterTypeRoomState: FfiConverterRustBuffer {
                 localAudioMuted: FfiConverterBool.read(from: &buf), 
                 localVideoMuted: FfiConverterBool.read(from: &buf), 
                 bindableRemoteVideoUserIds: FfiConverterSequenceString.read(from: &buf), 
-                localVideoBindable: FfiConverterBool.read(from: &buf)
+                localVideoBindable: FfiConverterBool.read(from: &buf), 
+                localScreenSharing: FfiConverterBool.read(from: &buf), 
+                bindableRemoteScreenUserIds: FfiConverterSequenceString.read(from: &buf)
         )
     }
 
@@ -2010,6 +2551,8 @@ public struct FfiConverterTypeRoomState: FfiConverterRustBuffer {
         FfiConverterBool.write(value.localVideoMuted, into: &buf)
         FfiConverterSequenceString.write(value.bindableRemoteVideoUserIds, into: &buf)
         FfiConverterBool.write(value.localVideoBindable, into: &buf)
+        FfiConverterBool.write(value.localScreenSharing, into: &buf)
+        FfiConverterSequenceString.write(value.bindableRemoteScreenUserIds, into: &buf)
     }
 }
 
@@ -2131,14 +2674,27 @@ public enum EdusdkEventKind {
     case userPermissionsChanged
     case myStageStatusChanged
     case mediaOpenHintChanged
+    case localScreenShareChanged
+    case screenShareUsersChanged
+    /**
+     * 台下应播的流集合变了（上下台、屏幕共享起停、续签）。
+     * 宿主收到后从快照重读 `live_streams`，不要只认 payload。
+     */
+    case liveChanged
+    case livePlaybackStatsUpdated
+    case livePlaybackEvent
     case whiteboardSyncOutbound
     case whiteboardSyncReceived
     case whiteboardLiveStrokeOutbound
     case whiteboardLiveStrokeReceived
+    case whiteboardMediaReceived
     case whiteboardSyncReloadRequested
     case whiteboardRecoveryRequested
+    case whiteboardMediaClock
     case imMessageOutbound
     case imMessageReceived
+    case teachingToolsUpdated
+    case whiteboardMediaProgramResult
     case error
 }
 
@@ -2195,23 +2751,41 @@ public struct FfiConverterTypeEdusdkEventKind: FfiConverterRustBuffer {
         
         case 19: return .mediaOpenHintChanged
         
-        case 20: return .whiteboardSyncOutbound
+        case 20: return .localScreenShareChanged
         
-        case 21: return .whiteboardSyncReceived
+        case 21: return .screenShareUsersChanged
         
-        case 22: return .whiteboardLiveStrokeOutbound
+        case 22: return .liveChanged
         
-        case 23: return .whiteboardLiveStrokeReceived
+        case 23: return .livePlaybackStatsUpdated
         
-        case 24: return .whiteboardSyncReloadRequested
+        case 24: return .livePlaybackEvent
         
-        case 25: return .whiteboardRecoveryRequested
+        case 25: return .whiteboardSyncOutbound
         
-        case 26: return .imMessageOutbound
+        case 26: return .whiteboardSyncReceived
         
-        case 27: return .imMessageReceived
+        case 27: return .whiteboardLiveStrokeOutbound
         
-        case 28: return .error
+        case 28: return .whiteboardLiveStrokeReceived
+        
+        case 29: return .whiteboardMediaReceived
+        
+        case 30: return .whiteboardSyncReloadRequested
+        
+        case 31: return .whiteboardRecoveryRequested
+        
+        case 32: return .whiteboardMediaClock
+        
+        case 33: return .imMessageOutbound
+        
+        case 34: return .imMessageReceived
+        
+        case 35: return .teachingToolsUpdated
+        
+        case 36: return .whiteboardMediaProgramResult
+        
+        case 37: return .error
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -2297,40 +2871,76 @@ public struct FfiConverterTypeEdusdkEventKind: FfiConverterRustBuffer {
             writeInt(&buf, Int32(19))
         
         
-        case .whiteboardSyncOutbound:
+        case .localScreenShareChanged:
             writeInt(&buf, Int32(20))
         
         
-        case .whiteboardSyncReceived:
+        case .screenShareUsersChanged:
             writeInt(&buf, Int32(21))
         
         
-        case .whiteboardLiveStrokeOutbound:
+        case .liveChanged:
             writeInt(&buf, Int32(22))
         
         
-        case .whiteboardLiveStrokeReceived:
+        case .livePlaybackStatsUpdated:
             writeInt(&buf, Int32(23))
         
         
-        case .whiteboardSyncReloadRequested:
+        case .livePlaybackEvent:
             writeInt(&buf, Int32(24))
         
         
-        case .whiteboardRecoveryRequested:
+        case .whiteboardSyncOutbound:
             writeInt(&buf, Int32(25))
         
         
-        case .imMessageOutbound:
+        case .whiteboardSyncReceived:
             writeInt(&buf, Int32(26))
         
         
-        case .imMessageReceived:
+        case .whiteboardLiveStrokeOutbound:
             writeInt(&buf, Int32(27))
         
         
-        case .error:
+        case .whiteboardLiveStrokeReceived:
             writeInt(&buf, Int32(28))
+        
+        
+        case .whiteboardMediaReceived:
+            writeInt(&buf, Int32(29))
+        
+        
+        case .whiteboardSyncReloadRequested:
+            writeInt(&buf, Int32(30))
+        
+        
+        case .whiteboardRecoveryRequested:
+            writeInt(&buf, Int32(31))
+        
+        
+        case .whiteboardMediaClock:
+            writeInt(&buf, Int32(32))
+        
+        
+        case .imMessageOutbound:
+            writeInt(&buf, Int32(33))
+        
+        
+        case .imMessageReceived:
+            writeInt(&buf, Int32(34))
+        
+        
+        case .teachingToolsUpdated:
+            writeInt(&buf, Int32(35))
+        
+        
+        case .whiteboardMediaProgramResult:
+            writeInt(&buf, Int32(36))
+        
+        
+        case .error:
+            writeInt(&buf, Int32(37))
         
         }
     }
@@ -2980,6 +3590,54 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeBackendSnapshot: FfiConverterRustBuffer {
+    typealias SwiftType = BackendSnapshot?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeBackendSnapshot.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeBackendSnapshot.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeClassroomTimerSnapshot: FfiConverterRustBuffer {
+    typealias SwiftType = ClassroomTimerSnapshot?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeClassroomTimerSnapshot.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeClassroomTimerSnapshot.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeErrorInfo: FfiConverterRustBuffer {
     typealias SwiftType = ErrorInfo?
 
@@ -3004,6 +3662,30 @@ fileprivate struct FfiConverterOptionTypeErrorInfo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeRoomState: FfiConverterRustBuffer {
+    typealias SwiftType = RoomState?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeRoomState.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeRoomState.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeMobileClassPhase: FfiConverterRustBuffer {
     typealias SwiftType = MobileClassPhase?
 
@@ -3020,6 +3702,30 @@ fileprivate struct FfiConverterOptionTypeMobileClassPhase: FfiConverterRustBuffe
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeMobileClassPhase.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionSequenceTypeImMessageSnapshot: FfiConverterRustBuffer {
+    typealias SwiftType = [ImMessageSnapshot]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceTypeImMessageSnapshot.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceTypeImMessageSnapshot.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -3125,6 +3831,61 @@ fileprivate struct FfiConverterSequenceTypeImMessageSnapshot: FfiConverterRustBu
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeLiveStreamSnapshot: FfiConverterRustBuffer {
+    typealias SwiftType = [LiveStreamSnapshot]
+
+    public static func write(_ value: [LiveStreamSnapshot], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeLiveStreamSnapshot.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [LiveStreamSnapshot] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [LiveStreamSnapshot]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeLiveStreamSnapshot.read(from: &buf))
+        }
+        return seq
+    }
+}
+public func nativeLiveLicenceComplete(generation: UInt64, code: Int32, message: String) -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_edusdk_headless_fn_func_native_live_licence_complete(
+        FfiConverterUInt64.lower(generation),
+        FfiConverterInt32.lower(code),
+        FfiConverterString.lower(message),$0
+    )
+})
+}
+/**
+ * Internal vendor-resource bridge; deliberately independent of a classroom Engine.
+ */
+public func nativeLiveLicencePrepare(url: String, key: String) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_edusdk_headless_fn_func_native_live_licence_prepare(
+        FfiConverterString.lower(url),
+        FfiConverterString.lower(key),$0
+    )
+})
+}
+/**
+ * UI-only reducer. Call on the presentation worker, independently of EdusdkClient.
+ */
+public func uiFeedback(requestJson: String) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_edusdk_headless_fn_func_ui_feedback(
+        FfiConverterString.lower(requestJson),$0
+    )
+})
+}
+
 private enum InitializationResult {
     case ok
     case contractVersionMismatch
@@ -3140,6 +3901,15 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_edusdk_headless_checksum_func_native_live_licence_complete() != 26574) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_edusdk_headless_checksum_func_native_live_licence_prepare() != 18404) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_edusdk_headless_checksum_func_ui_feedback() != 11580) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_edusdk_headless_checksum_method_edusdkclient_apply_backend_join() != 24151) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3152,7 +3922,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_edusdk_headless_checksum_method_edusdkclient_backend_snapshot() != 28889) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_edusdk_headless_checksum_method_edusdkclient_begin_shutdown() != 30200) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_edusdk_headless_checksum_method_edusdkclient_classroom_timer() != 4947) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_edusdk_headless_checksum_method_edusdkclient_classroom_view_json() != 6715) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_edusdk_headless_checksum_method_edusdkclient_complete_host_effect() != 19416) {
@@ -3185,6 +3961,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_edusdk_headless_checksum_method_edusdkclient_grant_whiteboard_permission() != 64549) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_edusdk_headless_checksum_method_edusdkclient_im_history_json() != 63670) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_edusdk_headless_checksum_method_edusdkclient_im_messages() != 50796) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3204,6 +3983,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_edusdk_headless_checksum_method_edusdkclient_lift_all_message_mute() != 3553) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_edusdk_headless_checksum_method_edusdkclient_load_im_message_history() != 54219) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_edusdk_headless_checksum_method_edusdkclient_load_member_permissions() != 15584) {
@@ -3230,13 +4012,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_edusdk_headless_checksum_method_edusdkclient_mute_video() != 1976) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_edusdk_headless_checksum_method_edusdkclient_poll_events() != 47003) {
+    if (uniffi_edusdk_headless_checksum_method_edusdkclient_poll_runtime_update() != 36688) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_edusdk_headless_checksum_method_edusdkclient_poll_host_effects() != 9971) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_edusdk_headless_checksum_method_edusdkclient_poll_telemetry_effects() != 48007) {
+    if (uniffi_edusdk_headless_checksum_method_edusdkclient_prepare_teaching_tool_authoring() != 16677) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_edusdk_headless_checksum_method_edusdkclient_prompt_user_open_camera() != 30207) {
@@ -3249,6 +4028,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_edusdk_headless_checksum_method_edusdkclient_remove_user_from_stage() != 62941) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_edusdk_headless_checksum_method_edusdkclient_request_classroom_continuation() != 44903) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_edusdk_headless_checksum_method_edusdkclient_request_teaching_tools() != 55400) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_edusdk_headless_checksum_method_edusdkclient_request_whiteboard_media_program() != 18667) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_edusdk_headless_checksum_method_edusdkclient_revoke_all_message_permission() != 20832) {
@@ -3278,13 +4066,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_edusdk_headless_checksum_method_edusdkclient_send_whiteboard_live_stroke() != 7746) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_edusdk_headless_checksum_method_edusdkclient_send_whiteboard_media() != 39178) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_edusdk_headless_checksum_method_edusdkclient_send_whiteboard_sync() != 13689) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_edusdk_headless_checksum_method_edusdkclient_shutdown() != 30728) {
+    if (uniffi_edusdk_headless_checksum_method_edusdkclient_shutdown() != 10282) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_edusdk_headless_checksum_method_edusdkclient_start_class() != 40076) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_edusdk_headless_checksum_method_edusdkclient_start_screen_share() != 3611) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_edusdk_headless_checksum_method_edusdkclient_stop_screen_share() != 18774) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_edusdk_headless_checksum_method_edusdkclient_user_cancel_hand() != 51650) {
@@ -3294,6 +4091,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_edusdk_headless_checksum_method_edusdkclient_user_raise_hand() != 57407) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_edusdk_headless_checksum_method_edusdkclient_whiteboard_media_cleanup() != 24295) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_edusdk_headless_checksum_constructor_edusdkclient_new() != 21842) {

@@ -3,61 +3,255 @@ import UIKit
 import DrawsKit
 import EduSDK
 
+private enum ChatTokens {
+    static let inset: CGFloat = 16
+    static let gap: CGFloat = 12
+    static let metaGap: CGFloat = 8
+    static let controlHeight: CGFloat = 44
+    static let bodySize: CGFloat = 14
+    static let metaSize: CGFloat = MobileClassroomTokens.metaSize
+    static let bubbleWidth: CGFloat = 0.82
+    static let emptyHeight: CGFloat = 180
+    static let outlineWidth: CGFloat = 1
+    static let maxInputLength = 4000
+    static let millisecondsPerSecond: Double = 1000
+}
+
 struct ClassroomChatView: View {
-    let messages: [ImMessage]
+    let messages: [ClassroomChatMessageView]
     let currentUserId: String
-    let onSendMessage: (String) -> Void
+    let onSendMessage: (String) async -> Bool
     var sendPermissionDenied: Bool = false
+    var compact: Bool = false
+    var folded: Bool = false
+    var onNotice: (String) -> Void = { _ in }
     @State private var draft = ""
+    @State private var reactionsOpen = false
+    @FocusState private var composerFocused: Bool
+    @State private var sending = false
+    @State private var sendTask: Task<Void, Never>?
+    @State private var historyAnchor: String?
+    @State private var browsingHistory = false
+    @Environment(\.liveUiSnapshot) private var liveSnapshot
+    private var readOnly: Bool { liveSnapshot.map { $0.classroomView.runtime.mode != "active" } ?? false }
+    @Environment(\.chatHistoryControls) private var history
+
+    private func send() { submit(draft) }
+
+    private func submit(_ submittedDraft: String) {
+        let content = submittedDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !content.isEmpty, !sendPermissionDenied, !readOnly, !sending else { return }
+        sending = true
+        sendTask = Task { @MainActor in
+            let success = await onSendMessage(content)
+            guard !Task.isCancelled else { return }
+            if success {
+                if draft == submittedDraft { draft = "" }
+                browsingHistory = false
+            }
+            sending = false
+            sendTask = nil
+        }
+    }
+
+    @ViewBuilder private var historyHeader: some View {
+        if history.loading || history.error || history.hasMore {
+        Button {
+            historyAnchor = messages.first?.id
+            browsingHistory = !messages.isEmpty
+            history.load()
+        } label: {
+            HStack(spacing: ChatTokens.metaGap) {
+                if history.loading { ProgressView().tint(EduColors.onSurfaceVariant) }
+                Text(EduI18n.text(history.loading ? "chatHistoryLoading" : history.error ? "chatHistoryRetry" : history.hasMore ? "chatLoadEarlier" : "chatHistoryEnd"))
+                    .font(EduFont.sans(ChatTokens.metaSize))
+            }
+            .foregroundStyle(history.error ? EduColors.error : EduColors.onSurfaceVariant)
+            .padding(.horizontal, ChatTokens.gap)
+            .frame(minHeight: ChatTokens.controlHeight)
+            .background(EduColors.surfaceLowest, in: RoundedRectangle(cornerRadius: EduDimens.radius2xl))
+            .overlay(RoundedRectangle(cornerRadius: EduDimens.radius2xl).stroke(EduColors.outlineVariant, lineWidth: ChatTokens.outlineWidth))
+        }
+        .buttonStyle(.plain)
+        .disabled(!history.ready || history.loading || (!history.hasMore && !history.error))
+        .frame(maxWidth: .infinity)
+        } else if !messages.isEmpty {
+            Text(EduI18n.text("chatHistoryEnd")).font(EduFont.sans(MobileClassroomTokens.metaSize))
+                .foregroundStyle(EduColors.onSurfaceVariant).frame(maxWidth: .infinity)
+                .frame(height: MobileClassroomTokens.historyCaption)
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            if messages.isEmpty {
-                VStack(spacing: 6) {
-                    Text(EduI18n.text("chatEmpty"))
-                    Text(EduI18n.text("chatEmptyHint")).font(EduFont.sans(12))
-                }
-                .foregroundStyle(EduColors.onSurfaceVariant)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 10) {
-                        ForEach(messages, id: \.id) { message in
-                            VStack(alignment: message.senderId == currentUserId ? .trailing : .leading, spacing: 4) {
-                                Text(message.senderId == currentUserId ? EduI18n.text("chatMe") : message.senderId)
-                                    .font(EduFont.sans(11))
-                                    .foregroundStyle(EduColors.onSurfaceVariant)
-                                Text(message.content)
-                                    .padding(8)
-                                    .background(EduColors.surfaceLow, in: RoundedRectangle(cornerRadius: 8))
+            GeometryReader { geometry in
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: MobileClassroomTokens.messageGap) {
+                            historyHeader
+                            if messages.isEmpty && history.loading {
+                                ClassroomSkeleton().frame(height: min(ChatTokens.emptyHeight, max(0, geometry.size.height - ChatTokens.inset * 2)))
+                            } else if messages.isEmpty {
+                                VStack(spacing: ChatTokens.metaGap) {
+                                    if geometry.size.height >= ChatTokens.emptyHeight {
+                                        Image(systemName: "bubble.left.and.bubble.right")
+                                            .font(.system(size: ChatTokens.controlHeight)).accessibilityHidden(true)
+                                            .padding(.bottom, ChatTokens.metaGap)
+                                    }
+                                    Text(EduI18n.text(history.loading ? "chatHistoryLoading" : history.notice ?? "chatEmpty"))
+                                        .font(EduFont.sans(ChatTokens.bodySize, weight: .semibold))
+                                }
+                                .foregroundStyle(EduColors.onSurfaceVariant)
+                                .multilineTextAlignment(.center)
+                                .frame(maxWidth: .infinity, minHeight: geometry.size.height >= ChatTokens.emptyHeight ? ChatTokens.emptyHeight : 0)
                             }
-                            .frame(maxWidth: .infinity, alignment: message.senderId == currentUserId ? .trailing : .leading)
+                            ForEach(messages, id: \.id) { message in
+                                ChatMessageRow(message: message, isSelf: message.senderId == currentUserId, maxWidth: max(0, geometry.size.width - ChatTokens.inset * 2) * ChatTokens.bubbleWidth)
+                                    .id(message.id)
+                            }
+                        }
+                        .padding(ChatTokens.inset)
+                    }
+                    .accessibilityLabel(EduI18n.text("chatMessageList"))
+                    .simultaneousGesture(DragGesture().onChanged { _ in browsingHistory = true })
+                    .onAppear { if let id = messages.last?.id { proxy.scrollTo(id, anchor: .bottom) } }
+                    .onChange(of: history.loading) { loading in
+                        if !loading, let id = historyAnchor { proxy.scrollTo(id, anchor: .top); historyAnchor = nil }
+                        else if !loading, !browsingHistory, let id = messages.last?.id { proxy.scrollTo(id, anchor: .bottom) }
+                    }
+                    .onChange(of: messages.last?.id) { id in
+                        if !history.loading, !browsingHistory, let id { proxy.scrollTo(id, anchor: .bottom) }
+                    }
+                    .overlay(alignment: .bottom) {
+                        if browsingHistory && !messages.isEmpty {
+                            Button {
+                                if let id = messages.last?.id { proxy.scrollTo(id, anchor: .bottom) }
+                                browsingHistory = false
+                            } label: {
+                                Label(EduI18n.text("chatLatest"), systemImage: "arrow.down")
+                                    .font(EduFont.sans(ChatTokens.metaSize))
+                                    .padding(.horizontal, ChatTokens.gap)
+                                    .frame(minHeight: ChatTokens.controlHeight)
+                                    .background(EduColors.surfaceLowest, in: Capsule())
+                                    .overlay(Capsule().stroke(EduColors.outlineVariant, lineWidth: ChatTokens.outlineWidth))
+                            }
+                            .buttonStyle(.plain).foregroundStyle(EduColors.onSurface)
+                            .padding(ChatTokens.metaGap)
                         }
                     }
-                    .padding(12)
                 }
             }
-            HStack(spacing: 8) {
-                TextField(EduI18n.text(sendPermissionDenied ? "chatPermissionPlaceholder" : "chatInput"), text: $draft)
-                    .textFieldStyle(.roundedBorder)
-                    .disabled(sendPermissionDenied)
-                Button(EduI18n.text(sendPermissionDenied ? "permissionUnavailableShort" : "chatSend")) {
-                    let content = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-                    draft = ""
-                    onSendMessage(content)
+            .frame(maxHeight: folded ? 0 : .infinity)
+            .clipped()
+            Rectangle().fill(EduColors.outlineVariant).frame(height: ChatTokens.outlineWidth)
+            if folded {
+                Text(EduI18n.text("portraitChatFolded"))
+                    .font(EduFont.sans(ChatTokens.bodySize))
+                    .foregroundStyle(EduColors.onSurfaceVariant)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            if compact && reactionsOpen {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: ChatTokens.metaGap) {
+                        ForEach(["portraitQuickHello", "portraitQuickClear", "portraitQuickAgain"], id: \.self) { key in
+                            Button(EduI18n.text(key)) { submit(EduI18n.text(key)) }
+                                .font(EduFont.sans(ChatTokens.metaSize))
+                                .padding(.horizontal, ChatTokens.gap)
+                                .padding(.vertical, ChatTokens.metaGap)
+                                .background(EduColors.surfaceContainer, in: Capsule())
+                        }
+                        Button(EduI18n.text("portraitQuickFlower")) { onNotice(EduI18n.text("portraitToastFlower")) }
+                            .font(EduFont.sans(ChatTokens.metaSize))
+                            .padding(.horizontal, ChatTokens.gap)
+                            .padding(.vertical, ChatTokens.metaGap)
+                            .background(EduColors.surfaceContainer, in: Capsule())
+                    }
+                    .padding(.horizontal, ChatTokens.gap)
                 }
-                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sendPermissionDenied)
+                HStack(spacing: ChatTokens.metaGap) {
+                    ForEach(["👏", "👍", "🙋", "🌸", "✍️"], id: \.self) { symbol in
+                        Button(symbol) { draft = String((draft + symbol).prefix(ChatTokens.maxInputLength)) }
+                            .padding(.horizontal, ChatTokens.metaGap)
+                            .padding(.vertical, 4)
+                            .background(EduColors.surfaceLow, in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+                .padding(.horizontal, ChatTokens.gap)
+            }
+            HStack(alignment: .bottom, spacing: 4) {
+                if compact {
+                    Button { composerFocused = false; reactionsOpen.toggle() } label: {
+                        Image(systemName: "face.smiling").font(.system(size: 20)).frame(width: 44, height: 44)
+                    }.buttonStyle(.plain).foregroundStyle(EduColors.onSurfaceVariant)
+                        .accessibilityLabel(EduI18n.text("portraitEmoji"))
+                }
+                TextField(EduI18n.text(sendPermissionDenied ? "chatPermissionPlaceholder" : "chatInput"), text: $draft)
+                    .font(EduFont.sans(ChatTokens.bodySize))
+                    .foregroundStyle(EduColors.onSurface)
+                    .padding(.horizontal, ChatTokens.gap)
+                    .frame(minHeight: ChatTokens.controlHeight)
+                    .background(EduColors.surfaceLow, in: RoundedRectangle(cornerRadius: 12))
+                    .accessibilityLabel(EduI18n.text("chatInputAria"))
+                    .focused($composerFocused)
+                    .onChange(of: composerFocused) { focused in if focused { reactionsOpen = false } }
+                    .submitLabel(.send).onSubmit(send)
+                    .disabled(sendPermissionDenied || readOnly)
+                    .onChange(of: draft) { value in if value.count > ChatTokens.maxInputLength { draft = String(value.prefix(ChatTokens.maxInputLength)) } }
+                Button(action: send) {
+                    Text(EduI18n.text(sending ? "chatSending" : "chatSend"))
+                        .font(EduFont.sans(ChatTokens.bodySize, weight: .semibold))
+                        .padding(.horizontal, ChatTokens.inset)
+                        .frame(minHeight: ChatTokens.controlHeight)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sendPermissionDenied || readOnly || sending ? EduColors.onSurfaceVariant : EduColors.onPrimary)
+                .background(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sendPermissionDenied || readOnly || sending ? EduColors.surfaceContainer : EduColors.primary, in: RoundedRectangle(cornerRadius: EduDimens.radiusXl))
+                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sendPermissionDenied || readOnly || sending)
             }
             .padding(8)
         }
+        .background(EduColors.surfaceLowest, ignoresSafeAreaEdges: [])
+        .accentColor(EduColors.primary)
+        .onDisappear { sendTask?.cancel(); sendTask = nil; sending = false }
+    }
+}
+
+private struct ChatMessageRow: View {
+    let message: ClassroomChatMessageView
+    let isSelf: Bool
+    let maxWidth: CGFloat
+    var body: some View {
+        VStack(alignment: isSelf ? .trailing : .leading, spacing: ChatTokens.metaGap) {
+            HStack(alignment: .firstTextBaseline, spacing: ChatTokens.metaGap) {
+                Text(isSelf ? EduI18n.text("chatMe") : message.senderDisplayName)
+                    .lineLimit(1).truncationMode(.tail).layoutPriority(0)
+                if message.sentAt > 0 {
+                    Text(Date(timeIntervalSince1970: Double(message.sentAt) / ChatTokens.millisecondsPerSecond), style: .time)
+                        .monospacedDigit().fixedSize().layoutPriority(1)
+                }
+            }
+            .font(EduFont.sans(ChatTokens.metaSize)).foregroundStyle(EduColors.onSurfaceVariant)
+            .frame(maxWidth: maxWidth, alignment: isSelf ? .trailing : .leading)
+            Text(message.content)
+                .font(EduFont.sans(ChatTokens.bodySize))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(ChatTokens.gap)
+                .foregroundStyle(isSelf ? EduColors.onPrimary : EduColors.onSurface)
+                .background(isSelf ? EduColors.primary : EduColors.surfaceLow, in: RoundedRectangle(cornerRadius: MobileClassroomTokens.cardRadius))
+                .frame(maxWidth: maxWidth, alignment: isSelf ? .trailing : .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: isSelf ? .trailing : .leading)
     }
 }
 
 struct MeetingSidebarView: View {
-    let participants: [ClassroomParticipant]
-    let messages: [ImMessage]
+    let toolsPanel: () -> AnyView
+    let participants: [ClassroomDirectoryMember]
+    let stageParticipants: [ClassroomParticipant]
+    let messages: [ClassroomChatMessageView]
     let currentUserId: String
-    let onSendMessage: (String) -> Void
+    let onSendMessage: (String) async -> Bool
     var sendPermissionDenied: Bool = false
     var membersNextCursor: String? = nil
     var membersLoading: Bool = false
@@ -73,12 +267,10 @@ struct MeetingSidebarView: View {
     var showLiveBadge: Bool = false
 
     @State private var tab = 0
-    @State private var selectedMember: ClassroomParticipant?
+    @State private var selectedMember: ClassroomDirectoryMember?
     @State private var selectedActions: [MemberActionAvailability] = []
     @State private var policyLoading = false
     @State private var actionLoading = false
-    private var onStage: [ClassroomParticipant] { participants.filter(\.onStage) }
-    private var audience: [ClassroomParticipant] { participants.filter { !$0.onStage } }
 
     private var anim: Animation? {
         instant ? nil : .timingCurve(0.4, 0, 0.2, 1, duration: EduMotion.sidebar)
@@ -87,7 +279,7 @@ struct MeetingSidebarView: View {
     private let tabs: [(String, String)] = [
         (EduIcons.group, EduI18n.text("tabParticipantsZh")),
         (EduIcons.chat, EduI18n.text("tabChatZh")),
-        (EduIcons.ext, EduI18n.text("activity")),
+        (EduIcons.ext, EduI18n.text("tools")),
     ]
 
     var body: some View {
@@ -124,20 +316,23 @@ struct MeetingSidebarView: View {
         .animation(anim, value: collapsed)
         .overlay(alignment: .bottom) {
             if let member = selectedMember {
+                PopupShell(visible: true, onDismiss: { selectedMember = nil }, alignBottom: true, modal: false) {
                 MemberActionsSheet(
-                    memberName: member.displayName,
+                    memberName: member.name,
+                    avatarUrl: member.avatarUrl,
                     actions: selectedActions,
                     policyLoading: policyLoading,
                     actionLoading: actionLoading,
                     onClose: { selectedMember = nil },
                     onSelect: { action in
                         actionLoading = true
-                        onMemberAction(action, member.id) {
+                        onMemberAction(action, member.userId) {
                             actionLoading = false
                             selectedMember = nil
                         }
                     }
                 )
+                }
             }
         }
     }
@@ -189,30 +384,9 @@ struct MeetingSidebarView: View {
                             if participants.isEmpty {
                                 placeholder(EduI18n.text("emptyParticipants"))
                             } else {
-                                if !onStage.isEmpty {
-                                    section(EduI18n.text("sectionOnStage"))
-                                    ForEach(onStage) { member in
-                                        ParticipantListItemView(participant: member) {
-                                            selectedMember = member
-                                            selectedActions = []
-                                            policyLoading = true
-                                            onLoadMemberActions(member.id) { selectedActions = $0; policyLoading = false }
-                                        }
-                                    }
-                                }
-                                if !audience.isEmpty {
-                                    if !onStage.isEmpty {
-                                        Spacer().frame(height: 32)
-                                    }
-                                    section(EduI18n.text("sectionInAudience"))
-                                    ForEach(audience) { member in
-                                        ParticipantListItemView(participant: member) {
-                                            selectedMember = member
-                                            selectedActions = []
-                                            policyLoading = true
-                                            onLoadMemberActions(member.id) { selectedActions = $0; policyLoading = false }
-                                        }
-                                    }
+                                ForEach(participants, id: \.userId) { member in
+                                    DirectoryMemberRow(member: member, rowHeight: MobileClassroomTokens.directoryRow,
+                                        onSelect: { selectedMember = member; selectedActions = []; policyLoading = true; onLoadMemberActions(member.userId) { selectedActions = $0; policyLoading = false } }, onAction: onMemberAction)
                                 }
                                 if membersNextCursor != nil || membersLoading {
                                     placeholder(
@@ -226,7 +400,6 @@ struct MeetingSidebarView: View {
                                 }
                             }
                         }
-                        .padding(16)
                     }
                 case 1:
                     ClassroomChatView(
@@ -236,7 +409,7 @@ struct MeetingSidebarView: View {
                         sendPermissionDenied: sendPermissionDenied
                     )
                 default:
-                    placeholder(EduI18n.text("activitiesPlaceholder"))
+                    toolsPanel()
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -261,7 +434,7 @@ struct MeetingSidebarView: View {
     @ViewBuilder
     private var stripSlot: some View {
         ParticipantStripView(
-            participants: onStage,
+            participants: stageParticipants,
             vertical: true,
             namespace: namespace,
             bindVideo: Self.bindsStripVideo(collapsed: collapsed),
@@ -320,15 +493,17 @@ enum MemberActionTokens {
 }
 
 private enum MemberActionsSheetMetrics {
+    static let avatarSize: CGFloat = 46
     static let rowSpacing: CGFloat = 6
-    static let padding: CGFloat = 18
-    static let outerPadding: CGFloat = 16
-    static let cornerRadius: CGFloat = 20
+    static let padding: CGFloat = FeedbackTokens.padding
+    static let outerPadding: CGFloat = FeedbackTokens.inset
+    static let cornerRadius: CGFloat = FeedbackTokens.radius
     static let shadowRadius: CGFloat = 24
 }
 
 struct MemberActionsSheet: View {
     let memberName: String
+    let avatarUrl: String?
     let actions: [MemberActionAvailability]
     var policyLoading: Bool = false
     var actionLoading: Bool
@@ -339,19 +514,13 @@ struct MemberActionsSheet: View {
         actions.filter { $0.available && $0.action != MemberActionTokens.viewPermissions }
     }
 
-    private var initials: String {
-        memberName.split(whereSeparator: { $0 == " " || $0 == "　" })
-            .prefix(2).compactMap { $0.first }.map(String.init).joined().uppercased()
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 12) {
-                Text(initials.isEmpty ? "?" : initials)
-                    .font(EduFont.sans(14, weight: .bold))
-                    .foregroundStyle(EduColors.primary)
-                    .frame(width: 46, height: 46)
-                    .background(EduColors.surfaceHigh, in: Circle())
+                RemoteAvatarImage(avatarUrl: avatarUrl)
+                    .frame(width: MemberActionsSheetMetrics.avatarSize, height: MemberActionsSheetMetrics.avatarSize)
+                    .clipShape(Circle())
                 VStack(alignment: .leading, spacing: 3) {
                     Text(memberName).font(EduFont.sans(16, weight: .bold))
                 }
@@ -488,29 +657,6 @@ extension View {
     }
 }
 
-struct ModalScrimHost<Content: View>: View {
-    let visible: Bool
-    var onDismiss: () -> Void
-    @ViewBuilder var content: () -> Content
-
-    var body: some View {
-        if visible {
-            ZStack {
-                // L2.6 scrim: onSurface 40% mix + tiered blur backdrop.
-                Rectangle()
-                    .fill(.ultraThinMaterial)
-                    .overlay(EduTint.onSurface40)
-                    .ignoresSafeArea()
-                    .onTapGesture(perform: onDismiss)
-                    .transition(.opacity)
-                content()
-                    .eduModalEnter(visible: true)
-            }
-            .transition(.opacity)
-            .animation(.timingCurve(0.4, 0, 0.2, 1, duration: EduMotion.modal), value: visible)
-        }
-    }
-}
 
 struct VideoWallView: View {
     let participants: [ClassroomParticipant]
@@ -564,15 +710,19 @@ struct VideoWallView: View {
 /// 与 Android `ThumbnailPopover` 对齐。
 struct ThumbnailPopoverView: View {
     var onDismiss: () -> Void
+    var sheet: Bool = false
+    var onNotice: (String) -> Void = { _ in }
 
     @ObservedObject private var host = WhiteboardHost.shared
+    @State private var selectedPage = 1
+    @State private var jumpText = ""
 
     private enum Tokens {
         static let gridSpacing: CGFloat = 12
         static let cellHeight: CGFloat = 72
         static let columns = 4
+        static let sheetColumns = 3
         static let panelPadding: CGFloat = 20
-        static let outerPadding: CGFloat = 40
         static let iconSize: CGFloat = 22
         static let titleSize: CGFloat = 18
         static let labelSize: CGFloat = 14
@@ -585,8 +735,17 @@ struct ThumbnailPopoverView: View {
     private var columns: [GridItem] {
         Array(
             repeating: GridItem(.flexible(), spacing: Tokens.gridSpacing),
-            count: Tokens.columns
+            count: sheet ? Tokens.sheetColumns : Tokens.columns
         )
+    }
+
+    private func jump(_ page: Int) {
+        guard page >= 1, page <= totalPages else {
+            onNotice(EduI18n.text("portraitToastBadPage"))
+            return
+        }
+        let moved = hasCourseware ? WhiteboardHost.shared.gotoStep(page - 1) : WhiteboardHost.shared.gotoBoardIndex(page)
+        if moved { onDismiss() }
     }
 
     private var hasCourseware: Bool { host.coursewarePageCount > 0 }
@@ -598,15 +757,18 @@ struct ThumbnailPopoverView: View {
     }
 
     var body: some View {
+        let rows = ceil(CGFloat(totalPages + (hasCourseware ? 0 : 1)) / CGFloat(sheet ? Tokens.sheetColumns : Tokens.columns))
+        CoursewarePanelViewport(preferredHeight: rows * (Tokens.cellHeight + Tokens.gridSpacing) + (sheet ? 160 : 100), alignBottom: sheet) {
         VStack(alignment: .leading, spacing: Tokens.gridSpacing) {
             HStack {
                 Text(EduI18n.text("thumbnailWhiteboard"))
                     .font(EduFont.sans(Tokens.titleSize, weight: .semibold))
                 Spacer()
                 Button(action: onDismiss) {
-                    EduIcon(EduIcons.close, size: Tokens.iconSize, tint: EduColors.onSurfaceVariant)
+                    EduIcon(EduIcons.close, size: Tokens.iconSize, tint: EduColors.onSurfaceVariant).frame(width: 44, height: 44)
                 }
                 .buttonStyle(EduPressButtonStyle())
+                .accessibilityLabel(EduI18n.text("close"))
             }
             if hasCourseware, !host.coursewareTitle.isEmpty {
                 Text(host.coursewareTitle)
@@ -614,19 +776,15 @@ struct ThumbnailPopoverView: View {
                     .foregroundStyle(EduColors.onSurfaceVariant)
                     .lineLimit(1)
             }
+            ScrollView {
             LazyVGrid(columns: columns, spacing: Tokens.gridSpacing) {
                 ForEach(1...totalPages, id: \.self) { page in
-                    let selected = page == host.boardIndex
+                    let selected = page == (sheet ? selectedPage : host.boardIndex)
                     let url = host.coursewareThumbUrls.indices.contains(page - 1)
                         ? host.coursewareThumbUrls[page - 1]
                         : ""
                     Button {
-                        if hasCourseware {
-                            guard WhiteboardHost.shared.gotoStep(page - 1) else { return }
-                        } else {
-                            guard WhiteboardHost.shared.gotoBoardIndex(page) else { return }
-                        }
-                        onDismiss()
+                        if sheet { selectedPage = page } else { jump(page) }
                     } label: {
                         ZStack {
                             if url.isEmpty {
@@ -655,6 +813,7 @@ struct ThumbnailPopoverView: View {
                     }
                     .buttonStyle(EduPressButtonStyle())
                     .disabled(whiteboardPermissionDenied)
+                    .accessibilityLabel(EduI18n.text(selected ? "thumbnailPageActive" : "thumbnailPage", ["page": page]))
                 }
                 if !hasCourseware {
                     Button {
@@ -676,11 +835,29 @@ struct ThumbnailPopoverView: View {
                     .accessibilityLabel(Text(EduI18n.text("ariaAddWhiteboard")))
                 }
             }
+            }.frame(maxHeight: .infinity).clipped()
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel(EduI18n.text("thumbnailWhiteboard"))
+                .accessibilityIdentifier("thumbnail-grid")
+            if sheet {
+                HStack {
+                    TextField(EduI18n.text("portraitJumpLabel"), text: $jumpText)
+                        .keyboardType(.numberPad).frame(minHeight: 44)
+                        .disabled(whiteboardPermissionDenied)
+                    Button(EduI18n.text("portraitJumpAction")) {
+                        jump(Int(jumpText) ?? selectedPage)
+                    }.frame(minWidth: 44, minHeight: 44)
+                        .disabled(whiteboardPermissionDenied)
+                }
+            }
         }
         .padding(Tokens.panelPadding)
-        .eduGlass(cornerRadius: EduDimens.radius2xl, borderColor: EduColors.surfaceLow, tier: .soft)
-        .padding(Tokens.outerPadding)
-        .onAppear { WhiteboardHost.shared.refreshCourseware() }
+        .accessibilityIdentifier("thumbnail-panel")
+        }
+        .onAppear {
+            selectedPage = host.boardIndex
+            WhiteboardHost.shared.refreshCourseware()
+        }
     }
 }
 
@@ -744,6 +921,7 @@ private struct CoursewareThumbImageView: View {
 }
 
 struct SettingsModalView: View {
+    @ObservedObject var controller: ClassroomController
     var onDismiss: () -> Void
     var onCheckDevices: () -> Void = {}
     @State private var tab = 1
@@ -806,6 +984,7 @@ struct SettingsModalView: View {
                 }
                 ScrollView {
                     switch tab {
+                    case 0: continuationPanel
                     case 1: videoPanel
                     case 2: audioPanel
                     default:
@@ -830,6 +1009,69 @@ struct SettingsModalView: View {
         }
         .frame(width: 720, height: 560)
         .eduGlass(cornerRadius: EduDimens.radius2xl, borderColor: EduColors.surfaceLow, tier: .soft)
+    }
+
+    private var continuationPanel: some View {
+        let view = controller.snapshot.continuation?.settings
+        let ready = view != nil && (view?.storage == "ready" || view?.storage == "saving")
+        let media = view?.settings.media
+        return VStack(alignment: .leading, spacing: 12) {
+            Text(EduI18n.text(continuationStatusKey(view)))
+                .font(EduFont.sans(13))
+                .foregroundStyle(EduColors.secondary)
+            continuationToggle("continuationAutoWindow", media?.autoWindow == true, ready) {
+                controller.updateContinuationPreference("auto_window", enabled: $0)
+            }
+            continuationToggle("continuationBackgroundAudio", media?.backgroundAudio == true, ready) {
+                controller.updateContinuationPreference("background_audio", enabled: $0)
+            }
+            continuationToggle("continuationBackgroundMicrophone", media?.backgroundMicrophone == true, ready) {
+                controller.updateContinuationPreference("background_microphone", enabled: $0)
+            }
+            Text(EduI18n.text("continuationWindowCloseSetting"))
+                .font(EduFont.sans(14, weight: .semibold))
+            ForEach(Array([
+                (nil as String?, "continuationAskEveryTime"),
+                ("continue", "continuationCloseContinue"),
+                ("leave", "continuationCloseLeave"),
+            ].enumerated()), id: \.offset) { _, item in
+                let selected = view?.settings.windowClose == item.0
+                Button {
+                    controller.updateContinuationPreference("window_close", choice: item.0)
+                } label: {
+                    Text(EduI18n.text(item.1))
+                        .font(EduFont.sans(14))
+                        .foregroundStyle(selected ? EduColors.onPrimary : EduColors.onSurface)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(selected ? EduColors.primary : EduColors.chipBg)
+                        .clipShape(RoundedRectangle(cornerRadius: EduDimens.radiusLg))
+                }
+                .buttonStyle(EduPressButtonStyle())
+                .disabled(!ready)
+            }
+            Text(EduI18n.text("continuationMobileSettingsNote"))
+                .font(EduFont.sans(13))
+                .foregroundStyle(EduColors.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func continuationStatusKey(_ view: ContinuationSettingsView?) -> String {
+        guard let view else { return "continuationSettingsUnavailable" }
+        switch view.storage {
+        case "failed": return "continuationSettingsFailed"
+        case "loading": return "appLoading"
+        case "saving": return "continuationSettingsSaving"
+        default: return "continuationSettingsSaved"
+        }
+    }
+
+    private func continuationToggle(_ key: String, _ checked: Bool, _ enabled: Bool, change: @escaping (Bool) -> Void) -> some View {
+        Toggle(isOn: Binding(get: { checked }, set: change)) {
+            Text(EduI18n.text(key)).font(EduFont.sans(14))
+        }
+        .disabled(!enabled)
     }
 
     private var panelTitle: String {

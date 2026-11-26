@@ -24,7 +24,8 @@ extension EduSdk {
             classroomId: obj["classroomId"] as? String,
             appId: obj["appId"] as? String,
             ts: obj["ts"] as? String,
-            data: obj["data"] as? [String: Any] ?? [:]
+            data: obj["data"] as? [String: Any] ?? [:],
+            extras: obj.filter { !classroomImSignalEnvelopeKeys.contains($0.key) }
         )
         try adapter.sendClassroomSignal(envelope)
         #else
@@ -54,13 +55,16 @@ extension EduSdk {
             apiAddr
         )
         teardownIm()
+        let hostGeneration = currentHostEffectGeneration()
         imConnectionGeneration = generation
         let adapter = createOpenImIosAdapter(
             options: OpenImIosAdapterOptions(
                 onSignal: { [weak self] envelope in
+                    guard self?.currentHostEffectGeneration() == hostGeneration else { return }
                     self?.handleImSignal(envelope, classroomId: classroomId)
                 },
                 onMessage: { [weak self] message in
+                    guard self?.currentHostEffectGeneration() == hostGeneration else { return }
                     NSLog("[edusdk] IM chat message id=%@ sender=%@", message.id, message.senderId)
                     self?.applyImMessage(
                         id: message.id,
@@ -71,6 +75,7 @@ extension EduSdk {
                     )
                 },
                 onError: { [weak self] err in
+                    guard self?.currentHostEffectGeneration() == hostGeneration else { return }
                     let sdkErr = SdkError(code: .imProviderError, message: err.message)
                     DispatchQueue.main.async {
                         self?.errorListeners.forEach { $0(sdkErr) }
@@ -93,41 +98,41 @@ extension EduSdk {
                     token: token
                 )
             )
+        } catch {
+            throw failImConnect(phase: "im.login_failed", classroomId: classroomId, error: error)
+        }
+        do {
+            guard currentHostEffectGeneration() == hostGeneration else { adapter.destroy(); return }
             NSLog("[edusdk] IM login ok classroomId=%@", classroomId)
             try adapter.joinClassroomGroup(classroomId: classroomId)
+            guard currentHostEffectGeneration() == hostGeneration else { adapter.destroy(); return }
             NSLog("[edusdk] IM joinClassroomGroup ok classroomId=%@", classroomId)
         } catch {
-            let message = error.localizedDescription
-            NSLog("[edusdk] IM connect failed classroomId=%@: %@", classroomId, message)
-            let sdkErr = SdkError(code: .imProviderError, message: "IM connect failed: \(message)")
-            DispatchQueue.main.async { [weak self] in
-                self?.errorListeners.forEach { $0(sdkErr) }
-            }
-            teardownIm()
-            throw error
+            throw failImConnect(phase: "im.group_join_failed", classroomId: classroomId, error: error)
         }
         #else
         throw SdkError(code: .imProviderError, message: "OpenIMCore is not linked")
         #endif
     }
 
+    private func failImConnect(phase: String, classroomId: String, error: Error) -> Error {
+        let message = error.localizedDescription
+        NSLog("[edusdk] %@ classroomId=%@: %@", phase, classroomId, message)
+        let sdkErr = SdkError(code: .imProviderError, message: "\(phase): \(message)")
+        // Core receives the failure receipt and owns bounded recovery / terminal errors.
+        teardownIm()
+        return sdkErr
+    }
+
     /// HostEffect 的可靠发送路径：失败必须抛出，Core 才能按 IM 域处理。
-    func sendTextMessage(_ content: String) throws {
+    func sendTextMessage(_ content: String) throws -> [String: Any] {
         #if canImport(OpenIMCore)
-        guard let adapter = imAdapter as? OpenImIosAdapter,
-              let conversationId = classroomId else {
+        guard let adapter = imAdapter as? OpenImIosAdapter else {
             throw SdkError(code: .imProviderError, message: "IM classroom group is not ready")
         }
-        try adapter.sendTextMessage(content)
-        let userId = (try? withCore { try core.backendSnapshot().localUserId }) ?? "local"
-        let now = Int64(Date().timeIntervalSince1970 * 1000)
-        applyImMessage(
-            id: "local:\(userId):\(now)",
-            senderId: userId,
-            content: content,
-            sentAt: now,
-            conversationId: conversationId
-        )
+        let message = try adapter.sendTextMessage(content)
+        let sentAt: Any = message.sentAt.map { NSNumber(value: $0) as Any } ?? NSNull()
+        return ["message_id": message.id, "sent_at": sentAt]
         #else
         throw SdkError(code: .imProviderError, message: "OpenIMCore is not linked")
         #endif
@@ -211,11 +216,13 @@ extension EduSdk {
     }
 
     private func envelopeToJson(_ envelope: ClassroomImSignalEnvelope) -> String {
-        var obj: [String: Any] = [
-            "signalId": envelope.signalId,
-            "type": envelope.type,
-            "data": envelope.data,
-        ]
+        // 顶层未知字段先写，已知字段随后覆盖，保证平台搬运不会改写协议语义
+        var obj: [String: Any] = envelope.extras.filter {
+            !classroomImSignalEnvelopeKeys.contains($0.key)
+        }
+        obj["signalId"] = envelope.signalId
+        obj["type"] = envelope.type
+        obj["data"] = envelope.data
         if let v = envelope.v { obj["v"] = v }
         if let classroomId = envelope.classroomId { obj["classroomId"] = classroomId }
         if let appId = envelope.appId { obj["appId"] = appId }

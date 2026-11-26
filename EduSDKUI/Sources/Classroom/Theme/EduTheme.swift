@@ -5,6 +5,11 @@ import UIKit
 
 /// Aligns with ui/web/src/styles/tokens.css
 public enum EduColors {
+    static let panelGreenSurface = adaptive(light: MobileClassroomTokens.panelGreenSurface, dark: MobileClassroomTokens.darkPanelGreenSurface)
+    static let panelAmberSurface = adaptive(light: MobileClassroomTokens.panelAmberSurface, dark: MobileClassroomTokens.darkPanelAmberSurface)
+    static let panelAmberInk = adaptive(light: MobileClassroomTokens.panelAmberInk, dark: MobileClassroomTokens.darkPanelAmberInk)
+    static let panelRaisedSurface = adaptive(light: MobileClassroomTokens.panelRaisedSurface, dark: MobileClassroomTokens.darkPanelRaisedSurface)
+
     private static func adaptive(light: UInt32, dark: UInt32) -> Color {
         #if canImport(UIKit)
         return Color(UIColor { traits in
@@ -21,35 +26,59 @@ public enum EduColors {
         #endif
     }
 
-    public static let surface = adaptive(light: 0xF8F9FF, dark: 0x101418)
-    public static let surfaceBright = adaptive(light: 0xF8F9FF, dark: 0x252A30)
-    public static let surfaceDim = adaptive(light: 0xCCDBF2, dark: 0x0B0F13)
-    public static let surfaceLowest = adaptive(light: 0xFFFFFF, dark: 0x080B0E)
-    public static let surfaceLow = adaptive(light: 0xEEF4FF, dark: 0x171C21)
-    public static let surfaceContainer = adaptive(light: 0xE5EFFF, dark: 0x1B2026)
-    public static let surfaceHigh = adaptive(light: 0xDBE9FF, dark: 0x252B32)
-    public static let surfaceHighest = adaptive(light: 0xD4E4FA, dark: 0x30363D)
+    public static let surface = adaptive(light: 0xF8F9FA, dark: 0x0F172A)
+    public static let surfaceBright = adaptive(light: 0xF8FAFC, dark: 0x1E293B)
+    public static let surfaceDim = adaptive(light: 0xE2E8F0, dark: 0x020617)
+    public static let surfaceLowest = adaptive(light: 0xFFFFFF, dark: 0x1E293B)
+    public static let surfaceLow = adaptive(light: 0xF1F5F9, dark: 0x1E293B)
+    public static let surfaceContainer = adaptive(light: 0xF1F5F9, dark: 0x334155)
+    public static let surfaceHigh = adaptive(light: 0xE2E8F0, dark: 0x334155)
+    public static let surfaceHighest = adaptive(light: 0xE2E8F0, dark: 0x475569)
     public static let surfaceVariant = surfaceHighest
-    public static let onSurface = adaptive(light: 0x0D1C2D, dark: 0xEDF1F5)
-    public static let onSurfaceVariant = adaptive(light: 0x46474A, dark: 0xC0C7CF)
-    public static let outline = adaptive(light: 0x76777B, dark: 0x9199A2)
-    public static let outlineVariant = adaptive(light: 0xC7C6CA, dark: 0x424951)
-    public static let primary = adaptive(light: 0x000000, dark: 0xFFFFFF)
-    public static let onPrimary = adaptive(light: 0xFFFFFF, dark: 0x111418)
-    public static let primaryContainer = adaptive(light: 0x1B1B1C, dark: 0xE3E7EB)
-    public static let secondary = adaptive(light: 0x505F76, dark: 0xBDC7D5)
-    public static let onSecondary = adaptive(light: 0xFFFFFF, dark: 0x202832)
-    public static let secondaryContainer = adaptive(light: 0xD0E1FB, dark: 0x344252)
-    public static let onSecondaryContainer = adaptive(light: 0x54647A, dark: 0xD9E5F5)
-    public static let error = adaptive(light: 0xBA1A1A, dark: 0xFFB4AB)
+    public static let onSurface = adaptive(light: 0x0F172A, dark: 0xF8FAFC)
+    public static let onSurfaceVariant = adaptive(light: 0x64748B, dark: 0x94A3B8)
+    public static let outline = adaptive(light: 0x64748B, dark: 0x94A3B8)
+    public static let outlineVariant = adaptive(light: 0xE2E8F0, dark: 0x334155)
+    public static let primary = adaptive(light: MobileClassroomTokens.primary, dark: 0x93B4FF)
+    public static let onPrimary = adaptive(light: 0xFFFFFF, dark: 0x0F172A)
+    public static let primarySoft = adaptive(light: MobileClassroomTokens.primarySoft, dark: MobileClassroomTokens.darkPrimarySoft)
+    public static let primaryContainer = adaptive(light: MobileClassroomTokens.primaryContainer, dark: MobileClassroomTokens.darkPrimaryContainer)
+    public static let secondary = adaptive(light: 0x64748B, dark: 0x94A3B8)
+    public static let onSecondary = adaptive(light: 0xFFFFFF, dark: 0x0F172A)
+    public static let secondaryContainer = adaptive(light: 0xF1F5F9, dark: 0x334155)
+    public static let onSecondaryContainer = adaptive(light: 0x475569, dark: 0xE2E8F0)
+    public static let error = adaptive(light: MobileClassroomTokens.danger, dark: 0xFFB4AB)
     public static let onError = adaptive(light: 0xFFFFFF, dark: 0x690005)
-    public static let live = adaptive(light: 0xBA1A1A, dark: 0xFFB4AB)
+    public static let live = adaptive(light: MobileClassroomTokens.danger, dark: 0xFFB4AB)
     public static let onLive = adaptive(light: 0xFFFFFF, dark: 0x690005)
-    public static let success = adaptive(light: 0x16A34A, dark: 0x6DDD8B)
+    public static let success = adaptive(light: 0x10B981, dark: 0x6DDD8B)
+    public static let unread = Color(hex: 0xF43F5E)
     public static let warning = adaptive(light: 0xD97706, dark: 0xFFB95C)
     public static let chipBg = adaptive(light: 0xF1F5F9, dark: 0x252B32)
     public static let glassFill = surfaceLowest.opacity(0.92)
     public static let scrim = Color(hex: 0x0F172A, opacity: 0.28)
+}
+
+enum PortraitTokens {
+    static let stageHeightOverWidth: CGFloat = 9 / 16
+    static let bubbleMaxFraction: CGFloat = 0.82
+    static let sheetScrimOpacity: Double = 0.45
+    static let indicatorWidth: CGFloat = 26
+    static let indicatorHeight: CGFloat = 3
+    static let unreadDot: CGFloat = 7
+    static let avatar: CGFloat = 48
+    static let cardRadius = MobileClassroomTokens.cardRadius
+    static let sheetRadius = MobileClassroomTokens.sheetRadius
+}
+
+@MainActor
+final class PortraitSession: ObservableObject {
+    static let shared = PortraitSession()
+    @Published var chatFolded = false
+
+    func reset() {
+        chatFolded = false
+    }
 }
 
 public enum EduDimens {
@@ -383,6 +412,13 @@ enum EduSafeArea {
         #else
         return Insets(top: 0, bottom: 0, leading: 0, trailing: 0)
         #endif
+    }
+
+    /// Window geometry is unaffected by the keyboard; use it for orientation decisions.
+    static var windowSize: CGSize? {
+        UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            .filter { $0.activationState == .foregroundActive }
+            .flatMap(\.windows).first(where: \.isKeyWindow)?.bounds.size
     }
 
     static var bottomInset: CGFloat { current.bottom }

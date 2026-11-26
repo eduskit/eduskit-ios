@@ -6,15 +6,10 @@ struct HostHttpFailure: LocalizedError {
     var errorDescription: String? { message }
 }
 
-/// Host 侧调用 sdk-api：`POST /v1/classrooms/:id/join`。
+/// Host 侧调用 sdk-api：`POST /v1/classrooms/join`。
 enum JoinHttpClient {
     private enum Tokens {
         static let timeoutSeconds: TimeInterval = 30
-        static let codeField = "code"
-        static let messageField = "message"
-        static let traceIdField = "traceId"
-        static let traceIdAltField = "trace_id"
-        static let traceIdHeader = "x-trace-id"
     }
 
     struct JoinWhiteboardCreds {
@@ -113,14 +108,8 @@ enum JoinHttpClient {
         let status = http?.statusCode ?? 0
         guard (200...299).contains(status) else {
             let text = capturedData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
-            throw HostHttpFailure(
-                statusCode: status,
-                message: formatHttpErrorMessage(
-                    status: status,
-                    body: text,
-                    headerTraceId: http?.value(forHTTPHeaderField: Tokens.traceIdHeader)
-                )
-            )
+            // 宿主只搬运原始响应体；分类与文案格式化都在 Core。
+            throw HostHttpFailure(statusCode: status, message: text)
         }
         guard let data = capturedData, !data.isEmpty else { return NSNull() }
         return try JSONSerialization.jsonObject(with: data)
@@ -184,14 +173,11 @@ enum JoinHttpClient {
         let status = http?.statusCode ?? 0
         guard (200...299).contains(status) else {
             let text = responseData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
-            throw SdkError(
-                code: .networkError,
-                message: formatHttpErrorMessage(
-                    status: status,
-                    body: text,
-                    headerTraceId: http?.value(forHTTPHeaderField: Tokens.traceIdHeader)
-                )
-            )
+            throw BackendErrors.classify(
+                status: status,
+                body: text,
+                headerTraceId: http?.value(forHTTPHeaderField: BackendErrors.traceIdHeader)
+            ).toSdkError()
         }
         guard let responseData, !responseData.isEmpty,
               let object = try JSONSerialization.jsonObject(with: responseData) as? [String: Any] else {
@@ -200,7 +186,7 @@ enum JoinHttpClient {
         return try unwrapApiEnvelope(object)
     }
 
-    /// GET /v1/coursewares/:id/manifest?classroomId= → opaque JSON string
+    /// GET /v1/coursewares/manifest?coursewareId=&classroomId= → opaque JSON string
     static func fetchCoursewareManifest(
         backendUrl: String,
         userToken: String,
@@ -226,11 +212,9 @@ enum JoinHttpClient {
             throw SdkError(code: .invalidState, message: "coursewareId is required")
         }
 
-        let encodedCw = cwId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? cwId
-        let encodedCls = roomId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? roomId
-        guard let url = URL(
-            string: "\(normalizedBase)/v1/coursewares/\(encodedCw)/manifest?classroomId=\(encodedCls)"
-        ) else {
+        var components = URLComponents(string: "\(normalizedBase)/v1/coursewares/manifest")
+        components?.queryItems = [URLQueryItem(name: "coursewareId", value: cwId), URLQueryItem(name: "classroomId", value: roomId)]
+        guard let url = components?.url else {
             throw SdkError(code: .invalidState, message: "invalid courseware manifest URL")
         }
 
@@ -265,14 +249,11 @@ enum JoinHttpClient {
         let code = http?.statusCode ?? 0
         let text = capturedData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
         guard (200...299).contains(code) else {
-            throw SdkError(
-                code: .networkError,
-                message: formatHttpErrorMessage(
-                    status: code,
-                    body: text,
-                    headerTraceId: http?.value(forHTTPHeaderField: Tokens.traceIdHeader)
-                )
-            )
+            throw BackendErrors.classify(
+                status: code,
+                body: text,
+                headerTraceId: http?.value(forHTTPHeaderField: BackendErrors.traceIdHeader)
+            ).toSdkError()
         }
         if code == 204 || text.isEmpty {
             return "{}"
@@ -316,18 +297,10 @@ enum JoinHttpClient {
         let startsAt = nonEmpty(classroomObj["startsAt"] as? String)
         let endsAt = nonEmpty(classroomObj["endsAt"] as? String)
         let actualStartedAt = nonEmpty(classroomObj["actualStartedAt"] as? String)
-        let effectiveStatus = resolveEffectiveClassroomStatus(
-            status: rawStatus,
-            startsAt: startsAt,
-            endsAt: endsAt
-        )
-        classroomObj["status"] = effectiveStatus
-        payload["classroom"] = classroomObj
-
         let classroom = JoinClassroom(
             classroomId: classroomId,
             name: nonEmpty(classroomObj["name"] as? String),
-            status: effectiveStatus,
+            status: rawStatus,
             startsAt: startsAt,
             endsAt: endsAt,
             actualStartedAt: actualStartedAt,
@@ -491,53 +464,34 @@ enum JoinHttpClient {
         return t.isEmpty ? nil : t
     }
 
-    private static func formatHttpErrorMessage(
-        status: Int,
-        body: String,
-        headerTraceId: String?
-    ) -> String {
-        let parsed = body.data(using: .utf8).flatMap {
-            try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
-        }
-        let message = nonEmpty(parsed?[Tokens.messageField] as? String) ?? "HTTP \(status)"
-        let code: String
-        if let number = parsed?[Tokens.codeField] as? Int {
-            code = String(number)
-        } else if let text = nonEmpty(parsed?[Tokens.codeField] as? String) {
-            code = text
-        } else {
-            code = String(status)
-        }
-        let traceId = nonEmpty(parsed?[Tokens.traceIdField] as? String)
-            ?? nonEmpty(parsed?[Tokens.traceIdAltField] as? String)
-            ?? nonEmpty(headerTraceId)
-        var lines = ["\(message)", "\(Tokens.codeField): \(code)"]
-        if let traceId {
-            lines.append("\(Tokens.traceIdField): \(traceId)")
-        }
-        return lines.joined(separator: "\n")
-    }
-
     private static func unwrapApiEnvelope(_ body: [String: Any]) throws -> [String: Any] {
         guard body["code"] != nil, body["data"] != nil else { return body }
-        let code = body["code"] as? Int ?? -1
-        guard code == 0 else {
-            let message = nonEmpty(body["message"] as? String) ?? "backend code \(code)"
-            let traceId = nonEmpty(body["traceId"] as? String) ?? nonEmpty(body["trace_id"] as? String)
-            var lines = [message, "\(Tokens.codeField): \(code)"]
-            if let traceId {
-                lines.append("\(Tokens.traceIdField): \(traceId)")
-            }
-            throw SdkError(code: .networkError, message: lines.joined(separator: "\n"))
+        guard body["code"] as? Int == 0 else {
+            // 200 + 非零业务码也要走同一张分类表，否则终态课堂会显示成网络错误。
+            let text = (try? JSONSerialization.data(withJSONObject: body))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            throw BackendErrors.classify(status: 0, body: text, headerTraceId: nil).toSdkError()
         }
         return body["data"] as? [String: Any] ?? [:]
     }
 }
 
 extension JoinHttpClient.JoinPayload {
-    func toJoinSuccessInfo() -> JoinSuccessInfo {
+    /// 上台列表在 join 落地时和 Core 产出 ClassInfo 时都要用，映射只保留一份。
+    func joinStageUsers() -> [StageUser] {
+        var users = onStageMembers.map {
+            StageUser(userId: $0.userId, displayName: $0.displayName, onStage: true)
+        }
+        if selfMember.stageStatus == "on", let localId = session.eduUserId,
+           !localId.isEmpty, !users.contains(where: { $0.userId == localId }) {
+            users.append(StageUser(userId: localId, displayName: session.nickname, onStage: true))
+        }
+        return users
+    }
+
+    /// `classInfo` 必须是 Core Backend 域产出的权威值；join 响应不得在端上二次映射相位。
+    func toJoinSuccessInfo(classInfo: ClassInfo) -> JoinSuccessInfo {
         let classroomId = classroom.classroomId
-        let title = classroom.name
         return JoinSuccessInfo(
             classroom: JoinSuccessClassroom(
                 classroomId: classroomId,
@@ -566,22 +520,8 @@ extension JoinHttpClient.JoinPayload {
                 canUseWhiteboard: selfMember.canUseWhiteboard,
                 canScreenShare: selfMember.canScreenShare
             ),
-            onStageUsers: {
-                var users = onStageMembers.map {
-                    StageUser(userId: $0.userId, displayName: $0.displayName, onStage: true)
-                }
-                if selfMember.stageStatus == "on", let localId = session.eduUserId,
-                   !localId.isEmpty, !users.contains(where: { $0.userId == localId }) {
-                    users.append(StageUser(userId: localId, displayName: session.nickname, onStage: true))
-                }
-                return users
-            }(),
-            classInfo: ClassInfo(
-                classroomId: classroomId,
-                phase: mapClassroomStatusToPhase(classroom.status),
-                lifecycleStatus: mapClassroomLifecycleStatus(classroom.status),
-                title: title
-            ),
+            onStageUsers: joinStageUsers(),
+            classInfo: classInfo,
             whiteboard: whiteboard.map {
                 JoinSuccessWhiteboard(
                     token: $0.token,
@@ -594,37 +534,5 @@ extension JoinHttpClient.JoinPayload {
                 )
             }
         )
-    }
-}
-
-/// 后台 status 是课堂生命周期唯一真相源；端侧不得按本地时钟推导 expired。
-func resolveEffectiveClassroomStatus(
-    status: String?,
-    startsAt: String? = nil,
-    endsAt: String? = nil,
-    now: Date = Date(timeIntervalSince1970: 0)
-) -> String {
-    _ = startsAt
-    _ = endsAt
-    _ = now
-    let raw = status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-    return raw.isEmpty ? "pending" : raw
-}
-
-/// sdk-api `classroom.status` → ClassPhase（与 Core / Web 对齐）
-func mapClassroomStatusToPhase(_ status: String?) -> ClassPhase {
-    switch status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-    case "live": return .inClass
-    case "ended", "expired": return .ended
-    default: return .entered
-    }
-}
-
-func mapClassroomLifecycleStatus(_ status: String?) -> ClassroomLifecycleStatus {
-    switch status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-    case "live": return .inProgress
-    case "ended": return .ended
-    case "expired": return .expired
-    default: return .notStarted
     }
 }

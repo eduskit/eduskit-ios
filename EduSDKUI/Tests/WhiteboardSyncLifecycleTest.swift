@@ -4,22 +4,24 @@ import EduSDK
 
 final class WhiteboardSyncLifecycleTest: XCTestCase {
     @MainActor
-    func testEndedPhaseUnbindsWhiteboardSync() {
+    func testTerminalStatusesUnbindWhiteboardSync() {
         var unbindCount = 0
 
-        ClassroomController.unbindWhiteboardSyncIfEnded(phase: .ended) {
-            unbindCount += 1
+        for status in [ClassroomLifecycleStatus.ended, .expired] {
+            ClassroomController.unbindWhiteboardSyncIfTerminal(lifecycleStatus: status) {
+                unbindCount += 1
+            }
         }
 
-        XCTAssertEqual(unbindCount, 1)
+        XCTAssertEqual(unbindCount, 2)
     }
 
     @MainActor
-    func testActivePhasesKeepWhiteboardSyncBound() {
+    func testActiveStatusesKeepWhiteboardSyncBound() {
         var unbindCount = 0
 
-        for phase in [ClassPhase.entered, .inClass] {
-            ClassroomController.unbindWhiteboardSyncIfEnded(phase: phase) {
+        for status in [ClassroomLifecycleStatus.notStarted, .inProgress] {
+            ClassroomController.unbindWhiteboardSyncIfTerminal(lifecycleStatus: status) {
                 unbindCount += 1
             }
         }

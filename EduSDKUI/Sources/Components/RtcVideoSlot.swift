@@ -1,13 +1,22 @@
 import SwiftUI
 import UIKit
+import EduSDK
 
+/// 视频绑定按 `VideoSlot`（userId + streamType）键化：同一个用户可以同时有摄像头
+/// 与屏幕共享两条轨道，只按 userId 绑会让共享画面覆盖掉对方的摄像头。
 struct ClassroomVideoBinder {
-    let bindUserVideo: (String, UIView) -> Void
-    let unbindUserVideo: (String, UIView) -> Void
+    let bindUserVideo: (VideoSlot, UIView) -> Void
+    let unbindUserVideo: (VideoSlot, UIView) -> Void
+    var bindLiveStream: (String, UIView) -> Void = { _, _ in }
+    var unbindLiveStream: (String, UIView) -> Void = { _, _ in }
 }
 
 private struct ClassroomVideoBinderKey: EnvironmentKey {
     static let defaultValue: ClassroomVideoBinder? = nil
+}
+
+private struct LiveUiSnapshotKey: EnvironmentKey {
+    static let defaultValue: UiSnapshot? = nil
 }
 
 extension EnvironmentValues {
@@ -15,15 +24,22 @@ extension EnvironmentValues {
         get { self[ClassroomVideoBinderKey.self] }
         set { self[ClassroomVideoBinderKey.self] = newValue }
     }
+
+    /// 当前课堂快照。格子据此决定绑 RTC 还是挂直播播放器。
+    var liveUiSnapshot: UiSnapshot? {
+        get { self[LiveUiSnapshotKey.self] }
+        set { self[LiveUiSnapshotKey.self] = newValue }
+    }
 }
 
-struct RtcVideoSlotView: UIViewRepresentable {
-    let userId: String
+/// 台下某一路转推流的渲染槽。与 [RtcVideoSlotView] 互斥。
+struct LiveVideoSlotView: UIViewRepresentable {
+    let streamName: String
     var cornerRadius: CGFloat = EduDimens.radiusXl
     @Environment(\.classroomVideoBinder) private var binder
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(userId: userId)
+        Coordinator(streamName: streamName)
     }
 
     func makeUIView(context: Context) -> RtcVideoHostView {
@@ -34,27 +50,80 @@ struct RtcVideoSlotView: UIViewRepresentable {
         context.coordinator.binder = binder
         view.onReady = { [weak coordinator = context.coordinator] readyView in
             guard let coordinator else { return }
-            coordinator.binder?.bindUserVideo(coordinator.userId, readyView)
+            coordinator.binder?.bindLiveStream(coordinator.streamName, readyView)
         }
         return view
     }
 
     func updateUIView(_ uiView: RtcVideoHostView, context: Context) {
-        if context.coordinator.userId != userId {
-            context.coordinator.binder?.unbindUserVideo(context.coordinator.userId, uiView)
+        if context.coordinator.streamName != streamName {
+            context.coordinator.binder?.unbindLiveStream(context.coordinator.streamName, uiView)
         }
-        context.coordinator.userId = userId
+        context.coordinator.streamName = streamName
         context.coordinator.binder = binder
         uiView.applyCornerRadius(cornerRadius)
         uiView.onReady = { [weak coordinator = context.coordinator] readyView in
             guard let coordinator else { return }
-            coordinator.binder?.bindUserVideo(coordinator.userId, readyView)
+            coordinator.binder?.bindLiveStream(coordinator.streamName, readyView)
         }
-        binder?.bindUserVideo(userId, uiView)
+        binder?.bindLiveStream(streamName, uiView)
     }
 
     static func dismantleUIView(_ uiView: RtcVideoHostView, coordinator: Coordinator) {
-        coordinator.binder?.unbindUserVideo(coordinator.userId, uiView)
+        coordinator.binder?.unbindLiveStream(coordinator.streamName, uiView)
+    }
+
+    final class Coordinator {
+        var streamName: String
+        var binder: ClassroomVideoBinder?
+
+        init(streamName: String) {
+            self.streamName = streamName
+        }
+    }
+}
+
+struct RtcVideoSlotView: UIViewRepresentable {
+    let userId: String
+    var cornerRadius: CGFloat = EduDimens.radiusXl
+    var streamType: EduStreamType = .camera
+    @Environment(\.classroomVideoBinder) private var binder
+
+    private var slot: VideoSlot { VideoSlot(userId: userId, streamType: streamType) }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(slot: slot)
+    }
+
+    func makeUIView(context: Context) -> RtcVideoHostView {
+        let view = RtcVideoHostView()
+        view.backgroundColor = .clear
+        view.isUserInteractionEnabled = false
+        view.applyCornerRadius(cornerRadius)
+        context.coordinator.binder = binder
+        view.onReady = { [weak coordinator = context.coordinator] readyView in
+            guard let coordinator else { return }
+            coordinator.binder?.bindUserVideo(coordinator.slot, readyView)
+        }
+        return view
+    }
+
+    func updateUIView(_ uiView: RtcVideoHostView, context: Context) {
+        if context.coordinator.slot != slot {
+            context.coordinator.binder?.unbindUserVideo(context.coordinator.slot, uiView)
+        }
+        context.coordinator.slot = slot
+        context.coordinator.binder = binder
+        uiView.applyCornerRadius(cornerRadius)
+        uiView.onReady = { [weak coordinator = context.coordinator] readyView in
+            guard let coordinator else { return }
+            coordinator.binder?.bindUserVideo(coordinator.slot, readyView)
+        }
+        binder?.bindUserVideo(slot, uiView)
+    }
+
+    static func dismantleUIView(_ uiView: RtcVideoHostView, coordinator: Coordinator) {
+        coordinator.binder?.unbindUserVideo(coordinator.slot, uiView)
     }
 
     @available(iOS 16.0, *)
@@ -67,11 +136,11 @@ struct RtcVideoSlotView: UIViewRepresentable {
     }
 
     final class Coordinator {
-        var userId: String
+        var slot: VideoSlot
         var binder: ClassroomVideoBinder?
 
-        init(userId: String) {
-            self.userId = userId
+        init(slot: VideoSlot) {
+            self.slot = slot
         }
     }
 }

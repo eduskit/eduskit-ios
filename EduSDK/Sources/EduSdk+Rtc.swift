@@ -10,22 +10,29 @@ extension EduSdk {
         if let existing = rtcAdapter as? TencentTrtcIosAdapter {
             return existing
         }
+        let generation = currentHostEffectGeneration()
         let adapter = createTencentTrtcIosAdapter(
             options: TencentTrtcIosAdapterOptions(
                 onEvent: { [weak self] event in
+                    guard self?.currentHostEffectGeneration() == generation else { return }
                     guard let classId = self?.classroomId else { return }
                     self?.handleRtcEvent(event, classId: classId)
                 },
                 onCustomMessage: { [weak self] message in
+                    guard self?.currentHostEffectGeneration() == generation else { return }
                     guard let classId = self?.classroomId else { return }
                     self?.handleRtcCustomMessage(message, classId: classId)
                 },
                 onError: { [weak self] error in
+                    guard self?.currentHostEffectGeneration() == generation else { return }
                     self?.emitRtcError(code: error.code, message: error.message)
                 }
             )
         )
         rtcAdapter = adapter
+        rtcPlaybackOutput.attach(adapter, output: adapter.setClassroomPlaybackAllowed) { [weak self] error in
+            self?.emitRtcError(code: 0, message: error.localizedDescription, report: false)
+        }
         return adapter
     }
 
@@ -45,16 +52,16 @@ extension EduSdk {
         }
         rtcLocalUserId = userId
         do {
-            try adapter.enterRoom(
+            try rtcPlaybackOutput.perform(adapter) { try adapter.enterRoom(
                 params: TrtcEnterParams(
                     sdkAppId: sdkAppId,
                     userId: userId,
                     userSig: userSig,
                     classId: classId
                 )
-            )
+            ) }
         } catch {
-            emitRtcError(code: 0, message: error.localizedDescription)
+            emitRtcError(code: 0, message: error.localizedDescription, report: false)
             teardownRtc()
             throw error
         }
@@ -70,64 +77,79 @@ extension EduSdk {
             rtcAdapter = nil
             return
         }
-        rtcAdapter = nil
-        adapter.destroy()
+        do {
+            try rtcPlaybackOutput.retire(adapter) { adapter.destroy() }
+            rtcAdapter = nil
+        } catch {
+            emitRtcError(code: 0, message: error.localizedDescription, report: false)
+        }
     }
 
-    public func bindUserVideo(userId: String, view: UIView) {
+    public func bindUserVideo(
+        userId: String,
+        view: UIView,
+        streamType: EduStreamType = .camera
+    ) {
         let id = userId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else { return }
         let canRetain = canRetainVideoBinds()
         guard canRetain else { return }
+        let slot = VideoSlot(userId: id, streamType: streamType)
         videoBindLock.lock()
         let epoch = videoBindEpoch
         let active = isVideoBindActive()
-        var hosts = videoViews[id, default: []]
+        var hosts = videoViews[slot.key, default: []]
         hosts.removeAll { $0.value == nil || $0.value === view }
         hosts.append(WeakRtcVideoView(view))
-        videoViews[id] = hosts
+        videoViews[slot.key] = hosts
         videoBindLock.unlock()
         guard active else { return }
-        scheduleVideoBind(userId: id, view: view, epoch: epoch)
+        scheduleVideoBind(slot: slot, view: view, epoch: epoch)
     }
 
-    public func unbindUserVideo(userId: String, view: UIView) {
+    public func unbindUserVideo(
+        userId: String,
+        view: UIView,
+        streamType: EduStreamType = .camera
+    ) {
         let id = userId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else { return }
+        let slot = VideoSlot(userId: id, streamType: streamType)
         videoBindLock.lock()
         let epoch = videoBindEpoch
-        var hosts = videoViews[id, default: []].filter { $0.value != nil }
+        var hosts = videoViews[slot.key, default: []].filter { $0.value != nil }
         let wasCurrent = hosts.last?.value === view
         hosts.removeAll { $0.value === view }
-        if boundVideoViews[id]?.value === view { boundVideoViews.removeValue(forKey: id) }
+        if boundVideoViews[slot.key]?.value === view {
+            boundVideoViews.removeValue(forKey: slot.key)
+        }
         let fallback = hosts.last?.value
         if hosts.isEmpty {
-            videoViews.removeValue(forKey: id)
+            videoViews.removeValue(forKey: slot.key)
         } else {
-            videoViews[id] = hosts
+            videoViews[slot.key] = hosts
         }
-        let localId = rtcLocalUserId
         videoBindLock.unlock()
         guard wasCurrent else { return }
         if let fallback {
-            scheduleVideoBind(userId: id, view: fallback, epoch: epoch)
+            scheduleVideoBind(slot: slot, view: fallback, epoch: epoch)
             return
         }
         enqueueRtc { [weak self] in
             guard let self else { return }
             self.videoBindLock.lock()
             let current = self.videoBindEpoch
-            let replacement = self.currentVideoViewLocked(userId: id)
+            let replacement = self.currentVideoViewLocked(slotKey: slot.key)
             self.videoBindLock.unlock()
             guard current == epoch, replacement == nil,
                   let adapter = self.rtcAdapter as? TencentTrtcIosAdapter else { return }
             DispatchQueue.main.async {
                 self.videoBindLock.lock()
                 let shouldStop = self.videoBindEpoch == epoch
-                    && self.currentVideoViewLocked(userId: id) == nil
+                    && self.currentVideoViewLocked(slotKey: slot.key) == nil
                 self.videoBindLock.unlock()
                 guard shouldStop else { return }
-                if id == localId {
+                if self.isLocalCameraSlot(slot) {
                     // 解绑 view ≠ 关设备：已开的采集继续推流，只切到占位 view。
                     if !self.localVideoCaptureMuted() {
                         let view = self.localVideoPlaceholder ?? UIView(frame: .zero)
@@ -135,20 +157,19 @@ extension EduSdk {
                         adapter.startLocalVideo(view: view)
                     }
                 } else {
-                    try? adapter.stopRemoteVideo(userId: id)
+                    try? adapter.stopRemoteVideo(userId: id, streamType: slot.streamType)
                 }
             }
         }
     }
 
-    private func scheduleVideoBind(userId: String, view: UIView, epoch: UInt64) {
+    private func scheduleVideoBind(slot: VideoSlot, view: UIView, epoch: UInt64) {
         enqueueRtc { [weak self] in
             guard let self else { return }
             self.videoBindLock.lock()
             let current = self.videoBindEpoch
-            let localId = self.rtcLocalUserId
-            let registeredView = self.currentVideoViewLocked(userId: userId)
-            let alreadyBound = self.boundVideoViews[userId]?.value === view
+            let registeredView = self.currentVideoViewLocked(slotKey: slot.key)
+            let alreadyBound = self.boundVideoViews[slot.key]?.value === view
             self.videoBindLock.unlock()
             guard current == epoch, registeredView === view, !alreadyBound,
                   let adapter = self.rtcAdapter as? TencentTrtcIosAdapter else { return }
@@ -157,31 +178,48 @@ extension EduSdk {
                 guard view.window != nil, view.bounds.width > 0, view.bounds.height > 0 else { return }
                 self.videoBindLock.lock()
                 let stillCurrent = self.videoBindEpoch == epoch
-                    && self.currentVideoViewLocked(userId: userId) === view
-                    && self.boundVideoViews[userId]?.value !== view
+                    && self.currentVideoViewLocked(slotKey: slot.key) === view
+                    && self.boundVideoViews[slot.key]?.value !== view
                 self.videoBindLock.unlock()
                 guard stillCurrent else { return }
-                if userId == localId {
+                // 可绑判定由 Core 拥有；不可绑时不调 Vendor，等 Core 更新后重绑。
+                guard self.isSlotBindable(self.readUiSnapshot(), slot) else { return }
+                if self.isLocalCameraSlot(slot) {
                     // 绑 view 只负责预览容器，不得代替 HostEffect 开摄像头。
-                    if self.localVideoCaptureMuted() { return }
                     adapter.startLocalVideo(view: view)
                 } else {
-                    // 可绑判定由 Core 拥有；不可绑时不调 Vendor，等 Core 更新后重绑。
-                    guard self.remoteVideoBindable(userId: userId) else { return }
                     do {
-                        try adapter.startRemoteVideo(userId: userId, view: view)
+                        try adapter.startRemoteVideo(
+                            userId: slot.userId,
+                            view: view,
+                            streamType: slot.streamType
+                        )
                     } catch {
                         return
                     }
                 }
                 self.videoBindLock.lock()
                 if self.videoBindEpoch == epoch,
-                   self.currentVideoViewLocked(userId: userId) === view {
-                    self.boundVideoViews[userId] = WeakRtcVideoView(view)
+                   self.currentVideoViewLocked(slotKey: slot.key) === view {
+                    self.boundVideoViews[slot.key] = WeakRtcVideoView(view)
                 }
                 self.videoBindLock.unlock()
             }
         }
+    }
+
+    /// 本端摄像头槽位走采集预览链路；本端的屏幕共享不在本地回显。
+    func isLocalCameraSlot(_ slot: VideoSlot) -> Bool {
+        slot.streamType == .camera && slot.userId == rtcLocalUserId
+    }
+
+    /// 可绑判定唯一实现在 Core；这里只按轨道查对应集合。
+    func isSlotBindable(_ snapshot: SdkSnapshot, _ slot: VideoSlot) -> Bool {
+        if slot.streamType == .screen {
+            return snapshot.bindableRemoteScreenUserIds.contains(slot.userId)
+        }
+        if isLocalCameraSlot(slot) { return snapshot.localVideoBindable }
+        return snapshot.bindableRemoteVideoUserIds.contains(slot.userId)
     }
 
     /**
@@ -194,36 +232,34 @@ extension EduSdk {
         let snapshot = readUiSnapshot()
         videoBindLock.lock()
         let epoch = videoBindEpoch
-        let localId = rtcLocalUserId
-        let targets = Array(videoViews.keys).compactMap { userId -> (String, UIView)? in
-            guard let view = currentVideoViewLocked(userId: userId) else { return nil }
-            return (userId, view)
+        let targets = Array(videoViews.keys).compactMap { key -> (VideoSlot, UIView)? in
+            guard let view = currentVideoViewLocked(slotKey: key),
+                  let slot = VideoSlot(key: key) else { return nil }
+            return (slot, view)
         }
-        let bound = Set(targets.compactMap { userId, view in
-            boundVideoViews[userId]?.value === view ? userId : nil
+        let bound = Set(targets.compactMap { slot, view in
+            boundVideoViews[slot.key]?.value === view ? slot.key : nil
         })
         videoBindLock.unlock()
 
-        for (userId, view) in targets {
-            let isLocal = userId == localId
-            let bindable = isLocal
-                ? snapshot.localVideoBindable
-                : snapshot.bindableRemoteVideoUserIds.contains(userId)
-            if bindable == bound.contains(userId) { continue }
+        for (slot, view) in targets {
+            let isLocal = isLocalCameraSlot(slot)
+            let bindable = isSlotBindable(snapshot, slot)
+            if bindable == bound.contains(slot.key) { continue }
             if bindable {
-                scheduleVideoBind(userId: userId, view: view, epoch: epoch)
+                scheduleVideoBind(slot: slot, view: view, epoch: epoch)
                 continue
             }
             videoBindLock.lock()
-            boundVideoViews.removeValue(forKey: userId)
+            boundVideoViews.removeValue(forKey: slot.key)
             videoBindLock.unlock()
             // 本地采集由 HostEffect 关闭，这里只撤销记账；远端必须显式停订阅，
             // 否则 Vendor 会继续把已失效的流推到这个 view 上。
-            if !isLocal { stopRemoteVideoBind(userId: userId, epoch: epoch) }
+            if !isLocal { stopRemoteVideoBind(slot: slot, epoch: epoch) }
         }
     }
 
-    private func stopRemoteVideoBind(userId: String, epoch: UInt64) {
+    private func stopRemoteVideoBind(slot: VideoSlot, epoch: UInt64) {
         enqueueRtc { [weak self] in
             guard let self else { return }
             self.videoBindLock.lock()
@@ -236,20 +272,20 @@ extension EduSdk {
                 let stillCurrent = self.videoBindEpoch == epoch
                 self.videoBindLock.unlock()
                 guard stillCurrent else { return }
-                try? adapter.stopRemoteVideo(userId: userId)
+                try? adapter.stopRemoteVideo(userId: slot.userId, streamType: slot.streamType)
             }
         }
     }
 
     /// Must be called while `videoBindLock` is held.
-    private func currentVideoViewLocked(userId: String) -> UIView? {
-        var hosts = videoViews[userId, default: []]
+    private func currentVideoViewLocked(slotKey: String) -> UIView? {
+        var hosts = videoViews[slotKey, default: []]
         hosts.removeAll { $0.value == nil }
         if hosts.isEmpty {
-            videoViews.removeValue(forKey: userId)
+            videoViews.removeValue(forKey: slotKey)
             return nil
         }
-        videoViews[userId] = hosts
+        videoViews[slotKey] = hosts
         return hosts.last?.value
     }
 
@@ -272,10 +308,27 @@ extension EduSdk {
                 "type": "remote_video_available",
                 "userId": userId,
                 "available": available,
-                "streamType": streamType,
+                "streamType": streamType.wire,
             ]) { _, new in new }
+        case let .localScreenShareAvailable(available):
+            payload.merge(["type": "local_screen_share_available", "available": available]) { _, new in new }
         case let .connectionLost(recoverable):
             payload.merge(["type": "connection_lost", "recoverable": recoverable]) { _, new in new }
+        case let .firstVideoFrame(userId, streamType, width, height):
+            payload.merge(["type": "first_video_frame", "userId": userId, "streamType": streamType.wire, "width": width, "height": height]) { _, new in new }
+        case let .localVoiceLevel(level):
+            payload.merge(["type": "local_voice_level", "level": level]) { _, new in new }
+        case let .sei(userId, serverMs):
+            payload.merge(["type": "sei", "userId": userId, "serverMs": serverMs]) { _, new in new }
+        case let .networkQuality(localQuality, uplinkNetworkQuality, downlinkNetworkQuality, remoteQualities):
+            var body: [String: Any] = [
+                "type": "network_quality",
+                "remoteQualities": remoteQualities.map { ["userId": $0.userId, "quality": $0.quality] },
+            ]
+            if let localQuality { body["localQuality"] = localQuality }
+            if let uplinkNetworkQuality { body["uplinkNetworkQuality"] = uplinkNetworkQuality }
+            if let downlinkNetworkQuality { body["downlinkNetworkQuality"] = downlinkNetworkQuality }
+            payload.merge(body) { _, new in new }
         }
         applyRtcPayload(payload)
     }
@@ -311,7 +364,9 @@ extension EduSdk {
             adapter.stopLocalVideo()
         } else {
             videoBindLock.lock()
-            let bound = rtcLocalUserId.flatMap { currentVideoViewLocked(userId: $0) }
+            let bound = rtcLocalUserId.flatMap {
+                currentVideoViewLocked(slotKey: VideoSlot(userId: $0, streamType: .camera).key)
+            }
             videoBindLock.unlock()
             let view = bound ?? localVideoPlaceholder ?? UIView(frame: .zero)
             if bound == nil {
@@ -334,11 +389,18 @@ extension EduSdk {
             try withCore { try core.applyProviderEvent(domain: "rtc", payloadJson: json) }
             pumpEvents()
         } catch {
-            emitRtcError(code: 0, message: error.localizedDescription)
+            emitRtcError(code: 0, message: error.localizedDescription, report: false)
         }
     }
 
-    private func emitRtcError(code: Int, message: String) {
+    private func emitRtcError(code: Int, message: String, report: Bool = true) {
+        if report {
+            applyRtcPayload([
+                "type": "error",
+                "vendor_code": String(code),
+                "reason": message,
+            ])
+        }
         let error = SdkError(code: .rtcProviderError, message: "TRTC(\(code)): \(message)")
         DispatchQueue.main.async { [weak self] in
             self?.errorListeners.forEach { $0(error) }

@@ -133,15 +133,23 @@ struct LandscapeGlassBottomBar: View {
     var videoMuted: Bool = true
     var onToggleMicrophone: () -> Void = {}
     var onToggleCamera: () -> Void = {}
-    var permissionDeniedActions: Set<String> = []
+    var toolbarEntries: [String: ToolbarEntry] = [:]
+    var handRaised: Bool = false
+    var localScreenSharing: Bool = false
+    var onToggleHand: () -> Void = {}
+    var onToggleScreenShare: () -> Void = {}
     var showCourseware: Bool = true
     var canEndClass: Bool = false
     var onInteract: () -> Void = {}
 
     private var micOn: Bool { !audioMuted }
     private var camOn: Bool { !videoMuted }
-    private let handUp = false
-    private let sharing = false
+    // 可见性与可用性全部来自 Core 的 interaction_policy。
+    private var mic: ToolbarEntry { toolbarEntries.entry("use_microphone") }
+    private var camera: ToolbarEntry { toolbarEntries.entry("use_camera") }
+    private var raiseHand: ToolbarEntry { toolbarEntries.entry("raise_hand") }
+    private var share: ToolbarEntry { toolbarEntries.entry("share_screen") }
+    private var courseware: ToolbarEntry { toolbarEntries.entry("operate_courseware") }
     @State private var layoutOpen = false
 
     private var resolvedBottomPadding: CGFloat {
@@ -163,29 +171,37 @@ struct LandscapeGlassBottomBar: View {
             }
 
             HStack(spacing: LandscapeChromeTokens.iconSpacing) {
-                iconBtn(icon: micOn ? EduIcons.mic : EduIcons.micOff, off: !micOn, enabled: !permissionDeniedActions.contains("use_microphone"), description: permissionDescription("use_microphone")) {
-                    onToggleMicrophone(); onInteract()
+                if mic.visible {
+                    iconBtn(icon: micOn ? EduIcons.mic : EduIcons.micOff, off: !micOn, enabled: !mic.disabled, description: restrictedLabel(EduI18n.text("controlMic"), mic)) {
+                        onToggleMicrophone(); onInteract()
+                    }
                 }
-                iconBtn(icon: camOn ? EduIcons.videocam : EduIcons.videocamOff, off: !camOn, enabled: !permissionDeniedActions.contains("use_camera"), description: permissionDescription("use_camera")) {
-                    onToggleCamera(); onInteract()
+                if camera.visible {
+                    iconBtn(icon: camOn ? EduIcons.videocam : EduIcons.videocamOff, off: !camOn, enabled: !camera.disabled, description: restrictedLabel(EduI18n.text("controlCamera"), camera)) {
+                        onToggleCamera(); onInteract()
+                    }
                 }
                 divider
 
                 iconBtn(icon: EduIcons.group, active: drawerOpen) {
                     onToggleDrawer(); onInteract()
                 }
-                if showCourseware {
-                    iconBtn(icon: EduIcons.description, active: coursewareOpen) {
+                if showCourseware && courseware.visible {
+                    iconBtn(icon: EduIcons.description, active: coursewareOpen, enabled: !courseware.disabled, description: restrictedLabel(EduI18n.text("controlSlides"), courseware)) {
                         onToggleCourseware(); onInteract()
                     }
                 }
                 divider
 
-                iconBtn(icon: EduIcons.frontHand, active: handUp) {
-                    onRequestInteraction("raise_hand"); onInteract()
+                if raiseHand.visible {
+                    iconBtn(icon: EduIcons.frontHand, active: handRaised, enabled: !raiseHand.disabled, description: restrictedLabel(EduI18n.text("controlRaiseHand"), raiseHand)) {
+                        onToggleHand(); onInteract()
+                    }
                 }
-                iconBtn(icon: EduIcons.screenShare, active: sharing, enabled: !permissionDeniedActions.contains("share_screen"), description: permissionDescription("share_screen")) {
-                    onRequestInteraction("share_screen"); onInteract()
+                if share.visible {
+                    iconBtn(icon: EduIcons.screenShare, active: localScreenSharing, enabled: !share.disabled, description: restrictedLabel(EduI18n.text("controlShare"), share)) {
+                        onToggleScreenShare(); onInteract()
+                    }
                 }
                 iconBtn(icon: EduIcons.viewAgenda, active: layoutOpen) {
                     withAnimation(.easeOut(duration: LandscapeChromeTokens.popupAnimDuration)) {
@@ -269,19 +285,6 @@ struct LandscapeGlassBottomBar: View {
         .opacity(enabled ? 1 : 0.45)
         .accessibilityLabel(Text(description ?? icon))
     }
-
-    private func permissionDescription(_ action: String) -> String {
-        let label: String
-        switch action {
-        case "use_microphone": label = EduI18n.text("controlMic")
-        case "use_camera": label = EduI18n.text("controlCamera")
-        case "share_screen": label = EduI18n.text("controlShare")
-        default: label = action
-        }
-        return permissionDeniedActions.contains(action)
-            ? "\(label) · \(EduI18n.text("permissionUnavailableShort"))"
-            : label
-    }
 }
 
 // MARK: - Orientation toggle (flat icon button, embedded in header actions)
@@ -322,16 +325,17 @@ struct OrientationToggleButton: View {
 // MARK: - Right side drawer (overlay + scrim + panel)
 
 struct RightSideDrawer: View {
-    let members: [ClassroomMember]
+    let toolsPanel: () -> AnyView
+    let members: [ClassroomDirectoryMember]
     var onStageUsers: [StageUser] = []
     var membersNextCursor: String? = nil
     var membersLoading: Bool = false
     var onLoadMoreMembers: () -> Void = {}
     var onLoadMemberActions: (String, @escaping ([MemberActionAvailability]) -> Void) -> Void = { _, callback in callback([]) }
     var onMemberAction: (String, String, @escaping () -> Void) -> Void = { _, _, done in done() }
-    let messages: [ImMessage]
+    let messages: [ClassroomChatMessageView]
     let currentUserId: String
-    let onSendMessage: (String) -> Void
+    let onSendMessage: (String) async -> Bool
     var sendPermissionDenied: Bool = false
     @Binding var open: Bool
     @Binding var tab: Int
@@ -350,6 +354,7 @@ struct RightSideDrawer: View {
 
             if open {
                 MobileTabPanelView(
+                        toolsPanel: toolsPanel,
                     members: members,
                     onStageUsers: onStageUsers,
                     membersNextCursor: membersNextCursor,

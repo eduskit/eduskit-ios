@@ -255,12 +255,12 @@ struct AnnotationToolbarContentView: View {
         .background {
             if mobile {
                 Capsule()
-                    .fill(Color.white)
+                    .fill(EduColors.surfaceLowest)
                     .overlay(Capsule().stroke(EduColors.surfaceLow, lineWidth: 1))
                     .eduShadow(.level3)
             } else {
                 RoundedRectangle(cornerRadius: EduDimens.radiusXl, style: .continuous)
-                    .fill(Color.white)
+                    .fill(EduColors.surfaceLowest)
                     .overlay(
                         RoundedRectangle(cornerRadius: EduDimens.radiusXl, style: .continuous)
                             .stroke(EduColors.surfaceLow, lineWidth: 1)
@@ -398,13 +398,13 @@ struct AnnotationToolbarContentView: View {
             }
         } label: {
             EduIcon(icon, size: mobile ? 18 : 20, tint: EduColors.onSurfaceVariant)
-                .frame(width: mobile ? 32 : 36, height: mobile ? 32 : 36)
+                .frame(width: mobile ? MobileClassroomTokens.touch : 36, height: mobile ? MobileClassroomTokens.touch : 36)
         }
         .buttonStyle(.plain)
     }
 
     private func annoBtn(icon: String, active: Bool, action: @escaping () -> Void) -> some View {
-        let size: CGFloat = mobile ? 32 : 36
+        let size: CGFloat = mobile ? MobileClassroomTokens.touch : 36
         return Button(action: action) {
             EduIcon(
                 icon,

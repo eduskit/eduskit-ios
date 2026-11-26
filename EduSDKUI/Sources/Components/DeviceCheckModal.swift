@@ -7,6 +7,9 @@ import UIKit
 private enum DeviceCheckTokens {
     static let previewAspectRatio: CGFloat = 16 / 9
     static let panelMaxWidth: CGFloat = 640
+    static let panelMaxHeight: CGFloat = 580
+    static let wideThreshold: CGFloat = 560
+    static let landscapePreviewWidth: CGFloat = 224
     static let stackPadding: CGFloat = 16
     static let meterHeight: CGFloat = 6
     static let heardThreshold = 8
@@ -24,16 +27,12 @@ struct DeviceCheckModalView: View {
     @State private var micHeard = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: DeviceCheckTokens.stackPadding / 2) {
-                Text(EduI18n.text("deviceCheckTitle"))
-                    .font(EduFont.sans(18, weight: .semibold))
-                    .foregroundStyle(EduColors.onSurface)
-                Text(EduI18n.text("deviceCheckSubtitle"))
-                    .foregroundStyle(EduColors.onSurfaceVariant)
-            }
-            .padding(DeviceCheckTokens.stackPadding)
-
+        DeviceCheckPanelLayout(onClose: controller.deferDeviceCheck, onConfirm: {
+            controller.confirmDeviceCheck(selection: DeviceCheckSelection(
+                cameraId: cameraId.isEmpty ? nil : cameraId,
+                microphoneId: microphoneId.isEmpty ? nil : microphoneId,
+                speakerId: speakerId.isEmpty ? nil : speakerId))
+        }, preview: {
             ZStack(alignment: .bottom) {
                 #if os(iOS)
                 DeviceCheckPreviewHost(cameraId: cameraId, controller: controller)
@@ -48,9 +47,9 @@ struct DeviceCheckModalView: View {
                 DeviceCheckMeter(level: micLevel)
                     .padding(DeviceCheckTokens.stackPadding)
             }
-            .aspectRatio(DeviceCheckTokens.previewAspectRatio, contentMode: .fit)
             .background(EduColors.surfaceLow)
 
+        }, controls: {
             VStack(alignment: .leading, spacing: DeviceCheckTokens.stackPadding) {
                 deviceSection(EduI18n.text("deviceCheckCamera"), devices: cameras, selected: cameraId) {
                     cameraId = $0
@@ -68,33 +67,13 @@ struct DeviceCheckModalView: View {
                     controller.playTestTone()
                 }
                 .foregroundStyle(EduColors.onSurface)
+                .frame(minHeight: 44)
                 if cameras.isEmpty || microphones.isEmpty {
                     Text(EduI18n.text("deviceCheckWarningEnter"))
                         .foregroundStyle(EduColors.onSurface)
                 }
-                HStack {
-                    Spacer()
-                    Button(EduI18n.text("deviceCheckLater")) {
-                        controller.deferDeviceCheck()
-                    }
-                    .foregroundStyle(EduColors.onSurfaceVariant)
-                    Button(EduI18n.text("deviceCheckConfirm")) {
-                        controller.confirmDeviceCheck(
-                            selection: DeviceCheckSelection(
-                                cameraId: cameraId.isEmpty ? nil : cameraId,
-                                microphoneId: microphoneId.isEmpty ? nil : microphoneId,
-                                speakerId: speakerId.isEmpty ? nil : speakerId
-                            )
-                        )
-                    }
-                    .foregroundStyle(EduColors.onPrimary)
-                }
             }
-            .padding(DeviceCheckTokens.stackPadding)
-        }
-        .frame(maxWidth: DeviceCheckTokens.panelMaxWidth)
-        .clipShape(RoundedRectangle(cornerRadius: EduDimens.radiusXl))
-        .eduGlass(cornerRadius: EduDimens.radiusXl, tier: .soft)
+        })
         .onAppear {
             controller.loadMediaDevices { devices in
                 cameras = devices.cameras
@@ -153,6 +132,75 @@ struct DeviceCheckModalView: View {
                 .clipShape(RoundedRectangle(cornerRadius: EduDimens.radiusLg))
         }
         .buttonStyle(EduPressButtonStyle())
+    }
+}
+
+/// Keeps dismissal and confirmation reachable while the device list scrolls.
+/// Preview constraints are explicit because the native video host has no intrinsic size.
+struct DeviceCheckPanelLayout<Preview: View, Controls: View>: View {
+    let onClose: () -> Void
+    let onConfirm: () -> Void
+    @ViewBuilder var preview: () -> Preview
+    @ViewBuilder var controls: () -> Controls
+
+    var body: some View {
+        GeometryReader { outer in
+            let safe = EduSafeArea.merge(with: outer)
+            let width = min(DeviceCheckTokens.panelMaxWidth,
+                max(0, outer.size.width - safe.leading - safe.trailing - MobileClassroomTokens.inset * 2))
+            let height = min(DeviceCheckTokens.panelMaxHeight,
+                max(0, outer.size.height - safe.top - safe.bottom - MobileClassroomTokens.inset * 2))
+            let wide = width >= DeviceCheckTokens.wideThreshold && width > height
+            let previewWidth = wide ? DeviceCheckTokens.landscapePreviewWidth : width - DeviceCheckTokens.stackPadding * 2
+            VStack(spacing: 0) {
+                HStack {
+                    Text(EduI18n.text("deviceCheckTitle"))
+                        .font(EduFont.sans(18, weight: .semibold))
+                        .foregroundStyle(EduColors.onSurface)
+                    Spacer(minLength: MobileClassroomTokens.gap)
+                    Button(action: onClose) {
+                        EduIcon(EduIcons.close, tint: EduColors.onSurfaceVariant)
+                            .frame(width: MobileClassroomTokens.touch, height: MobileClassroomTokens.touch)
+                    }
+                    .accessibilityLabel(EduI18n.text("close"))
+                    .accessibilityIdentifier("device-check-close")
+                }.padding(.horizontal, DeviceCheckTokens.stackPadding)
+                Divider()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: DeviceCheckTokens.stackPadding) {
+                        Text(EduI18n.text("deviceCheckSubtitle"))
+                            .font(EduFont.sans(14)).foregroundStyle(EduColors.onSurfaceVariant)
+                        // Keep the media host at the same structural position on rotation.
+                        HStack(alignment: .top, spacing: wide ? DeviceCheckTokens.stackPadding : 0) {
+                            VStack(alignment: .leading, spacing: DeviceCheckTokens.stackPadding) {
+                                preview()
+                                    .frame(width: previewWidth, height: previewWidth / DeviceCheckTokens.previewAspectRatio)
+                                    .clipped()
+                                    .accessibilityIdentifier("device-check-preview")
+                                if !wide { controls() }
+                            }
+                            if wide { controls().frame(maxWidth: .infinity) }
+                        }
+                    }.padding(DeviceCheckTokens.stackPadding)
+                }.frame(maxWidth: .infinity, maxHeight: .infinity).clipped()
+                Divider()
+                HStack {
+                    Spacer()
+                    Button(EduI18n.text("deviceCheckConfirm"), action: onConfirm)
+                        .foregroundStyle(EduColors.onPrimary)
+                        .frame(minHeight: MobileClassroomTokens.touch)
+                        .padding(.horizontal, DeviceCheckTokens.stackPadding)
+                        .background(EduColors.primary, in: RoundedRectangle(cornerRadius: MobileClassroomTokens.inset))
+                        .accessibilityIdentifier("device-check-confirm")
+                }.padding(MobileClassroomTokens.inset)
+            }
+            .frame(width: width, height: height)
+            .background(EduColors.surfaceLowest)
+            .clipShape(RoundedRectangle(cornerRadius: MobileClassroomTokens.sheetRadius, style: .continuous))
+            .accessibilityIdentifier("device-check-panel")
+            .position(x: safe.leading + (outer.size.width - safe.leading - safe.trailing) / 2,
+                y: safe.top + (outer.size.height - safe.top - safe.bottom) / 2)
+        }
     }
 }
 

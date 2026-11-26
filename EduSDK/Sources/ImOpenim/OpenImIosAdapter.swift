@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import CryptoKit
 import OpenIMCore
 
@@ -6,7 +7,8 @@ public protocol OpenImIosAdapter: AnyObject {
     func login(params: OpenImLoginParams) throws
     func joinClassroomGroup(classroomId: String) throws
     func sendClassroomSignal(_ envelope: ClassroomImSignalEnvelope) throws
-    func sendTextMessage(_ content: String) throws
+    func sendTextMessage(_ content: String) throws -> OpenImChatMessage
+    func loadHistory(cursor: String?, limit: Int) throws -> [String: Any]
     func logout()
     func destroy()
 }
@@ -38,24 +40,40 @@ private final class OpenImResult: NSObject, Open_im_sdk_callbackBaseProtocol, Op
     private let lock = NSLock()
     private let semaphore = DispatchSemaphore(value: 0)
     private var result: Result<String, Error>?
-    func onError(_ errCode: Int32, errMsg: String?) {
+    private var waiterQoS: qos_class_t = QOS_CLASS_UNSPECIFIED
+
+    /// 必须在发起厂商调用之前记录。回调可能在 `wait` 之前就回到另一条线程。
+    func captureWaiter() {
         lock.lock()
-        guard result == nil else { lock.unlock(); return }
-        result = .failure(OpenImAdapterError.operationFailed(code: errCode, message: "OpenIM operation failed"))
-        lock.unlock(); semaphore.signal()
+        waiterQoS = qos_class_self()
+        lock.unlock()
+    }
+
+    func onError(_ errCode: Int32, errMsg: String?) {
+        complete(.failure(OpenImAdapterError.operationFailed(code: errCode, message: "OpenIM operation failed")))
     }
     func onSuccess(_ data: String?) {
-        lock.lock()
-        guard result == nil else { lock.unlock(); return }
-        result = .success(data ?? ""); lock.unlock(); semaphore.signal()
+        complete(.success(data ?? ""))
     }
     func onProgress(_ progress: Int) {}
     func wait() throws -> String {
+        lock.lock()
+        waiterQoS = qos_class_self()
+        lock.unlock()
         guard semaphore.wait(timeout: .now() + OpenImTokens.operationTimeout) == .success else {
             throw OpenImAdapterError.invalidArgument("OpenIM operation timeout")
         }
         lock.lock(); defer { lock.unlock() }
         return try result!.get()
+    }
+
+    private func complete(_ value: Result<String, Error>) {
+        lock.lock()
+        guard result == nil else { lock.unlock(); return }
+        result = value
+        let needed = waiterQoS
+        lock.unlock()
+        OpenImBlockingSignal.signal(semaphore, waiterQoS: needed)
     }
 }
 private final class OpenImIosAdapterImpl: NSObject, OpenImIosAdapter,
@@ -72,7 +90,10 @@ private final class OpenImIosAdapterImpl: NSObject, OpenImIosAdapter,
     init(options: OpenImIosAdapterOptions) { self.options = options; super.init() }
     private func operation(_ start: (OpenImResult, String) -> Void) throws -> String {
         guard !Thread.isMainThread else { throw OpenImAdapterError.invalidArgument("OpenIM operations must run off main") }
-        let callback = OpenImResult(); start(callback, UUID().uuidString); return try callback.wait()
+        let callback = OpenImResult()
+        callback.captureWaiter()
+        start(callback, UUID().uuidString)
+        return try callback.wait()
     }
     private func json(_ value: Any) throws -> String {
         let data = try JSONSerialization.data(withJSONObject: value)
@@ -91,6 +112,7 @@ private final class OpenImIosAdapterImpl: NSObject, OpenImIosAdapter,
         let config = try json(["platformID": params.platformId, "apiAddr": params.apiAddr, "wsAddr": params.wsAddr,
                                "dataDir": storage.path, "logLevel": OpenImTokens.logError, "isLogStandardOutput": false])
         let sync = OpenImResult()
+        sync.captureWaiter()
         lock.lock(); active = true; groupId = nil; initialSync = sync; lock.unlock()
         initialized = Open_im_sdkInitSDK(self, UUID().uuidString, config)
         guard initialized else { throw OpenImAdapterError.invalidArgument("OpenIM initSDK failed") }
@@ -110,22 +132,57 @@ private final class OpenImIosAdapterImpl: NSObject, OpenImIosAdapter,
         guard response == "true" else { throw OpenImAdapterError.invalidArgument("OpenIM classroom membership is missing") }
         lock.lock(); groupId = classroomId; lock.unlock()
     }
-    private func send(_ message: String, onlineOnly: Bool) throws {
+    private func send(_ message: String, onlineOnly: Bool) throws -> String {
         lock.lock(); let group = groupId; lock.unlock()
         guard let group else { throw OpenImAdapterError.notLoggedIn }
-        _ = try operation { Open_im_sdkSendMessage($0, $1, message, "", group, "{}", onlineOnly) }
+        return try operation { Open_im_sdkSendMessage($0, $1, message, "", group, "{}", onlineOnly) }
     }
     func sendClassroomSignal(_ envelope: ClassroomImSignalEnvelope) throws {
-        var payload: [String: Any] = ["signalId": envelope.signalId, "type": envelope.type, "data": envelope.data]
+        // 顶层未知字段先写，已知字段随后覆盖，保证平台搬运不会改写协议语义
+        var payload: [String: Any] = envelope.extras.filter {
+            !classroomImSignalEnvelopeKeys.contains($0.key)
+        }
+        payload["signalId"] = envelope.signalId
+        payload["type"] = envelope.type
+        payload["data"] = envelope.data
         if let value = envelope.v { payload["v"] = value }
         if let value = envelope.classroomId { payload["classroomId"] = value }
         if let value = envelope.appId { payload["appId"] = value }
         if let value = envelope.ts { payload["ts"] = value }
         let message = Open_im_sdkCreateCustomMessage(UUID().uuidString, try json(payload), "", CLASSROOM_IM_SIGNAL_DESC)
-        try send(message, onlineOnly: true)
+        _ = try send(message, onlineOnly: true)
     }
-    func sendTextMessage(_ content: String) throws {
-        try send(Open_im_sdkCreateTextMessage(UUID().uuidString, content), onlineOnly: false)
+    func loadHistory(cursor: String?, limit: Int) throws -> [String: Any] {
+        lock.lock(); let group = groupId; lock.unlock()
+        guard let group else { throw OpenImAdapterError.notLoggedIn }
+        let conversationRaw = try operation { Open_im_sdkGetOneConversation($0, $1, Int32(OpenImTokens.groupSession), group) }
+        guard let conversation = try JSONSerialization.jsonObject(with: Data(conversationRaw.utf8)) as? [String: Any],
+              let conversationId = conversation["conversationID"] as? String else { throw OpenImAdapterError.invalidArgument("missing OpenIM conversation") }
+        let params = try json(["conversationID": conversationId, "startClientMsgID": cursor ?? "", "count": limit, "viewType": 0])
+        let raw = try operation { Open_im_sdkGetAdvancedHistoryMessageList($0, $1, params) }
+        guard let page = try JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+              let code = page["errCode"] as? Int, code == 0,
+              let isEnd = page["isEnd"] as? Bool, let messages = page["messageList"] as? [[String: Any]] else {
+            throw OpenImAdapterError.invalidArgument("invalid OpenIM history result")
+        }
+        let records: [[String: Any]] = messages.map { message in
+            ["id": message["clientMsgID"] ?? NSNull(), "conversation_id": message["groupID"] ?? NSNull(),
+             "sender_id": message["sendID"] ?? NSNull(), "sent_at": message["sendTime"] ?? NSNull(),
+             "sequence": message["seq"] ?? NSNull(),
+             "content": message["contentType"] as? Int == OpenImTokens.textMessage && message["sessionType"] as? Int == OpenImTokens.groupSession
+                ? ((message["textElem"] as? [String: Any])?["content"] ?? NSNull()) : NSNull()]
+        }
+        return ["records": records, "has_more": !isEnd]
+    }
+
+    func sendTextMessage(_ content: String) throws -> OpenImChatMessage {
+        let raw = try send(Open_im_sdkCreateTextMessage(UUID().uuidString, content), onlineOnly: false)
+        guard let message = try JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+              let id = message["clientMsgID"] as? String, let sender = message["sendID"] as? String,
+              let group = message["groupID"] as? String,
+              let text = (message["textElem"] as? [String: Any])?["content"] as? String,
+              let time = message["sendTime"] as? NSNumber else { throw OpenImAdapterError.invalidArgument("missing confirmed OpenIM message") }
+        return OpenImChatMessage(id: id, senderId: sender, content: text, sentAt: time.int64Value, classroomId: group)
     }
     func logout() { destroy() }
     func destroy() {
@@ -133,7 +190,8 @@ private final class OpenImIosAdapterImpl: NSObject, OpenImIosAdapter,
         let sync = initialSync; initialSync = nil; lock.unlock()
         sync?.onError(-1, errMsg: "OpenIM initial synchronization cancelled")
         guard initialized else { return }
-        _ = try? operation { Open_im_sdkLogout($0, $1) }
+        // Core closes classroom presence independently; local transport teardown
+        // must not wait for a remote logout response.
         Open_im_sdkUnInitSDK(UUID().uuidString)
         initialized = false
     }

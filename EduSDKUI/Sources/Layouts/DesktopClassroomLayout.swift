@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct DesktopClassroomLayout: View {
+    let toolsPanel: () -> AnyView
     let snapshot: UiSnapshot
     let title: String
     let elapsedLabel: String
@@ -14,6 +15,7 @@ struct DesktopClassroomLayout: View {
     var layoutFlipping: Bool = false
     var namespace: Namespace.ID
     var onOpenSettings: () -> Void
+    var onNotifications: () -> Void = {}
     var onOpenThumbnails: () -> Void
     var onZoomIn: () -> Void
     var onZoomOut: () -> Void
@@ -25,9 +27,11 @@ struct DesktopClassroomLayout: View {
     var onRequestInteraction: (String) -> Void = { _ in }
     var onToggleMicrophone: () -> Void = {}
     var onToggleCamera: () -> Void = {}
+    var onToggleHand: () -> Void = {}
+    var onToggleScreenShare: () -> Void = {}
     var featuredTeacher: ClassroomParticipant? = nil
     var onEnd: () -> Void
-    var onSendMessage: (String) -> Void
+    var onSendMessage: (String) async -> Bool
     var onLoadMoreMembers: () -> Void = {}
     var onLoadMemberActions: (String, @escaping ([MemberActionAvailability]) -> Void) -> Void = { _, callback in callback([]) }
     var onMemberAction: (String, String, @escaping () -> Void) -> Void = { _, _, done in done() }
@@ -44,7 +48,8 @@ struct DesktopClassroomLayout: View {
                     snapshot: snapshot,
                     title: title,
                     elapsedLabel: elapsedLabel,
-                    onOpenSettings: onOpenSettings
+                    onOpenSettings: onOpenSettings,
+                    onNotifications: onNotifications
                 )
                 HStack(spacing: 0) {
                     ZStack(alignment: .bottom) {
@@ -54,7 +59,9 @@ struct DesktopClassroomLayout: View {
                                     .transition(.opacity)
                             }
                             Group {
-                                if snapshot.isTeacherVideoMainStage() {
+                                if let sharing = snapshot.screenSharePresenter() {
+                                    ScreenShareStageView(userId: sharing.userId, displayName: sharing.displayName)
+                                } else if snapshot.isTeacherVideoMainStage() {
                                     MainVideoStageView(teacher: featuredTeacher, showLiveBadge: snapshot.needLive)
                                 } else {
                                     ContentCanvasView(
@@ -86,7 +93,11 @@ struct DesktopClassroomLayout: View {
                             videoMuted: snapshot.videoMuted,
                             onToggleMicrophone: onToggleMicrophone,
                             onToggleCamera: onToggleCamera,
-                            permissionDeniedActions: snapshot.permissionDeniedActions,
+                            toolbarEntries: snapshot.toolbarEntries,
+                            handRaised: snapshot.handRaised,
+                            localScreenSharing: snapshot.localScreenSharing,
+                            onToggleHand: onToggleHand,
+                            onToggleScreenShare: onToggleScreenShare,
                             showCourseware: !snapshot.isTeacherVideoMainStage(),
                             canEndClass: snapshot.canEndClass,
                             onEnd: onEnd
@@ -96,7 +107,9 @@ struct DesktopClassroomLayout: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                     MeetingSidebarView(
-                        participants: participants,
+                        toolsPanel: toolsPanel,
+                        participants: snapshot.classroomView.memberDirectory,
+                        stageParticipants: stageParticipants,
                         messages: snapshot.messages,
                         currentUserId: snapshot.userId,
                         onSendMessage: onSendMessage,

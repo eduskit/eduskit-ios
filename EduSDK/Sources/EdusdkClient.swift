@@ -1,5 +1,16 @@
 import Foundation
 
+func uiFeedback(requestJson: String) -> String {
+    preconditionFailure("UI feedback policy requires the generated Rust binding")
+}
+
+func nativeLiveLicencePrepare(url: String, key: String) -> String {
+    preconditionFailure("Native licence policy requires the generated Rust binding")
+}
+func nativeLiveLicenceComplete(generation: UInt64, code: Int32, message: String) -> String? {
+    preconditionFailure("Native licence policy requires the generated Rust binding")
+}
+
 // MARK: - UniFFI 占位（make build-mobile 后由生成代码替换）
 
 enum RoomPhase {
@@ -32,11 +43,18 @@ enum EdusdkEventKind {
     case classPhaseChanged, classroomLifecycleChanged
     case onStageUsersChanged, raisedHandListChanged, membersChanged, userPermissionsChanged, myStageStatusChanged
     case mediaOpenHintChanged
+    case localScreenShareChanged, screenShareUsersChanged
+    case livePlaybackStatsUpdated
+    case livePlaybackEvent
+    case liveChanged
     case whiteboardSyncOutbound, whiteboardSyncReceived
-    case whiteboardLiveStrokeOutbound, whiteboardLiveStrokeReceived
+    case whiteboardLiveStrokeOutbound, whiteboardLiveStrokeReceived, whiteboardMediaReceived
     case whiteboardSyncReloadRequested
     case whiteboardRecoveryRequested
+    case whiteboardMediaClock
     case imMessageOutbound, imMessageReceived
+    case teachingToolsUpdated
+    case whiteboardMediaProgramResult
     case error
 }
 
@@ -63,6 +81,7 @@ struct InitConfig {
     var platform: String? = nil
     var sdkVersion: String? = nil
     var appVersion: String? = nil
+    var liveSupportsLeb: Bool = false
 }
 
 struct RoomState {
@@ -72,6 +91,8 @@ struct RoomState {
     let localVideoMuted: Bool
     let bindableRemoteVideoUserIds: [String]
     let localVideoBindable: Bool
+    let localScreenSharing: Bool
+    let bindableRemoteScreenUserIds: [String]
 }
 
 struct ClassroomMemberSnapshot {
@@ -97,6 +118,19 @@ struct BackendSnapshot {
     var members: [ClassroomMemberSnapshot]
     var memberCount: UInt32
     var membersNextCursor: String?
+    var toolsJson: String? = nil
+    var liveStreams: [LiveStreamSnapshot] = []
+    var liveRelayVersion: Int64 = 0
+}
+
+struct LiveStreamSnapshot {
+    let streamName: String
+    let publisherUserId: String
+    let streamType: String
+    let url: String
+    let muted: Bool
+    let expiresAt: String
+    let playing: Bool
 }
 
 struct ErrorInfo {
@@ -121,6 +155,27 @@ enum EdusdkError: Error {
     }
 }
 
+struct MobileRuntimeUpdate {
+    let epoch: UInt64
+    let revision: UInt64
+    let events: [Event]
+    let hostEffects: [String]
+    let telemetryEffects: [String]
+    let backendSnapshot: BackendSnapshot?
+    let roomState: RoomState?
+    let classroomTimer: ClassroomTimerSnapshot?
+    let interactionPolicyJson: String?
+    let classroomViewJson: String?
+    let mediaOpenHintJson: String?
+    let continuationJson: String?
+    let imMessages: [ImMessageSnapshot]?
+    let imHistoryJson: String?
+    let nextWakeDelayMs: UInt64?
+    let hasMoreWork: Bool
+    let shutdownComplete: Bool
+    let shutdownTimedOut: Bool
+}
+
 struct Event {
     let kind: EdusdkEventKind
     let roomId: String?
@@ -132,10 +187,15 @@ struct Event {
 }
 
 final class EdusdkClient {
+    func pollRuntimeUpdate(forceSnapshot: Bool) throws -> MobileRuntimeUpdate {
+        throw EdusdkError(code: .notImplemented, message: "Runtime update requires the generated Rust binding")
+    }
     private var initialized = false
     private var inRoom = false
     private var roomId: String?
     private var classPhase: MobileClassPhase = .idle
+    /// 生命周期状态独立持有：`MobileClassPhase` 把 ended 与 expired 压成一个值，
+    /// 从相位反推永远产不出 expired。
     private var lifecycleStatus: MobileClassroomLifecycleStatus = .notStarted
     private var onStage: [String] = []
     private var localUserId: String?
@@ -145,11 +205,16 @@ final class EdusdkClient {
         initialized = true
     }
 
+    func beginShutdown() throws {
+        throw EdusdkError(code: .notImplemented, message: "Runtime shutdown requires the generated Rust binding")
+    }
+
     func shutdown() throws {
         initialized = false
         inRoom = false
         roomId = nil
         classPhase = .idle
+        lifecycleStatus = .notStarted
         onStage = []
         localUserId = nil
         classroomTitle = nil
@@ -171,6 +236,7 @@ final class EdusdkClient {
         inRoom = false
         roomId = nil
         classPhase = .idle
+        lifecycleStatus = .notStarted
         onStage = []
     }
 
@@ -180,9 +246,23 @@ final class EdusdkClient {
 
     func dismissMediaOpenHint() throws {}
 
+    func startScreenShare() throws {}
+
+    func stopScreenShare() throws {}
+
     func startClass() throws { classPhase = .inClass; lifecycleStatus = .inProgress }
     func endClass() throws { classPhase = .ended; lifecycleStatus = .ended; onStage = [] }
     func loadMembers(cursor: String) throws {}
+    func requestTeachingTools(requestJson: String) throws {}
+
+    func requestWhiteboardMediaProgram(requestJson: String) throws {}
+    func whiteboardMediaCleanup(requestJson: String) throws -> String {
+        throw EdusdkError(code:.notImplemented,message:"Media cleanup requires the generated native Core binding")
+    }
+    func requestClassroomContinuation(requestJson: String) throws {}
+    func prepareTeachingToolAuthoring(requestJson: String) throws -> String {
+        throw EdusdkError(code: .notImplemented, message: "Authoring requires the generated native Core binding")
+    }
     func inviteUserOnStage(userId: String) throws {
         if !onStage.contains(userId) { onStage.append(userId) }
     }
@@ -213,18 +293,18 @@ final class EdusdkClient {
     func revokeScreenSharePermission(userId: String) throws {}
     func sendWhiteboardSync(payloadJson: String) throws {}
     func sendWhiteboardLiveStroke(payloadJson: String) throws {}
+    func sendWhiteboardMedia(payloadJson: String) throws {}
     func sendImMessage(content: String) throws {}
+    func loadImMessageHistory(cursor: String?, limit: UInt32) throws { throw EdusdkError.failure(message: "NotImplemented: IM history requires native Core") }
+    func imHistoryJson() throws -> String { "{\"loading\":false,\"page\":null,\"error\":null}" }
 
     func imMessages() throws -> [ImMessageSnapshot] { [] }
 
-    func pollEvents() throws -> [Event] { [] }
 
     // stub 不编排副作用；签名必须与生成绑定一致，否则 EduSdk 在 stub 模式下编译不过。
-    func pollHostEffects() throws -> [String] { [] }
 
     func completeHostEffect(resultJson: String) throws {}
 
-    func pollTelemetryEffects() -> [String] { [] }
 
     func completeTelemetryEffect(resultJson: String) {}
 
@@ -237,7 +317,9 @@ final class EdusdkClient {
             localAudioMuted: false,
             localVideoMuted: false,
             bindableRemoteVideoUserIds: [],
-            localVideoBindable: false
+            localVideoBindable: false,
+            localScreenSharing: false,
+            bindableRemoteScreenUserIds: []
         )
     }
 
@@ -257,11 +339,28 @@ final class EdusdkClient {
         )
     }
 
-    func interactionPolicyJson() throws -> String { "[]" }
+    /// Stub 没有权限裁决能力，必须 fail-closed 返回完整动作表，
+    /// 否则 UI 会把“策略缺失”误读成“没有任何限制”。
+    /// 动作名与 schema/edusdk-sdk.yaml 的 ClassroomAction 由 validate-stub-parity 守门。
+    func interactionPolicyJson() throws -> String {
+        let items = Self.failClosedActions.map {
+            "{\"action\":\"\($0)\",\"visible\":true,\"available\":false,\"reason\":\"capability_not_ready\"}"
+        }
+        return "[" + items.joined(separator: ",") + "]"
+    }
+
+    /// schema/edusdk-sdk.yaml 的 ClassroomAction 全集。
+    private static let failClosedActions = [
+        "start_class", "end_class", "send_message", "use_microphone", "use_camera",
+        "raise_hand", "manage_own_stage", "manage_stage", "manage_remote_media",
+        "manage_permissions", "edit_whiteboard", "share_screen", "operate_courseware",
+    ]
     func memberActionPolicyJson(userId: String) throws -> String { "[]" }
     func loadMemberPermissions(userId: String) throws {}
 
     func mediaOpenHintJson() throws -> String { "{\"visible\":false,\"audience\":\"student\"}" }
+
+    func classroomViewJson() throws -> String { #"{"runtime":{"mode":"active","resources":{},"canLoadHistory":true,"canInspectDevices":true,"historyNotice":null},"chatMessages":[],"teacherVideoStage":false,"teacher":null,"participants":[],"memberDirectory":[],"toolCatalog":[],"coursewareItems":[],"screenPresenter":null,"handRaised":false,"networkStatus":"unknown","emptySeatCount":0,"canManageStage":false,"classroomKind":""}"# }
 
     func classroomTimer() throws -> ClassroomTimerSnapshot {
         ClassroomTimerSnapshot(mode: .hidden, seconds: nil)
@@ -288,6 +387,7 @@ final class EdusdkClient {
                 classroomTitle = name
             }
             classPhase = Self.mapClassroomStatus(classroom["status"] as? String)
+            lifecycleStatus = Self.mapClassroomLifecycle(classroom["status"] as? String)
         }
         if let session = root["session"] as? [String: Any],
            let uid = session["eduUserId"] as? String, !uid.isEmpty {
@@ -311,6 +411,15 @@ final class EdusdkClient {
         }
     }
 
+    private static func mapClassroomLifecycle(_ status: String?) -> MobileClassroomLifecycleStatus {
+        switch status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "live": return .inProgress
+        case "ended": return .ended
+        case "expired": return .expired
+        default: return .notStarted
+        }
+    }
+
     /// Host IM 信令入口（对齐 Web core.applyProviderEvent）。
     func applyProviderEvent(domain: String, payloadJson: String) throws {
         guard domain == "im" else { return }
@@ -318,8 +427,10 @@ final class EdusdkClient {
         switch type {
         case "classroom.started":
             classPhase = .inClass
+            lifecycleStatus = .inProgress
         case "classroom.ended", "classroom.expired":
             classPhase = .ended
+            lifecycleStatus = type == "classroom.expired" ? .expired : .ended
             onStage = []
         default:
             break

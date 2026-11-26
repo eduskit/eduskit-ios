@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct ClassroomHeaderView: View {
     let snapshot: UiSnapshot
@@ -7,6 +8,7 @@ struct ClassroomHeaderView: View {
     var brand: String = EduI18n.text("brandName")
     var isPhone: Bool = false
     var onOpenSettings: () -> Void
+    var onNotifications: () -> Void = {}
     var onBack: (() -> Void)? = nil
 
     /// 顶栏课堂状态：优先 badgeText（权威课堂四态），loading/error 时再覆盖
@@ -71,7 +73,7 @@ struct ClassroomHeaderView: View {
             .padding(.horizontal, 8)
 
             HStack(spacing: 4) {
-                Button {} label: {
+                Button(action: onNotifications) {
                     EduIcon(EduIcons.notifications, size: 20, tint: EduColors.secondary)
                         .padding(8)
                 }
@@ -94,9 +96,8 @@ struct ClassroomHeaderView: View {
 
     private var desktopHeader: some View {
         HStack(spacing: 0) {
-            // L2.5 Nexus mark — Path parity with Web `ClassroomHeader.vue` L43–67.
             HStack(spacing: 12) {
-                NexusMarkLogo(size: 32)
+                EduskitMark(size: 32)
                 Text(brand)
                     .font(EduFont.brand)
                     .foregroundStyle(EduColors.onSurface)
@@ -123,7 +124,7 @@ struct ClassroomHeaderView: View {
 
             // L2.5 actions gap 16
             HStack(spacing: 16) {
-                Button {} label: {
+                Button(action: onNotifications) {
                     EduIcon(EduIcons.notifications, size: 22, tint: EduColors.secondary)
                         .padding(8)
                 }
@@ -146,35 +147,23 @@ struct ClassroomHeaderView: View {
     }
 }
 
-/// L2.5 — SVG-parity Nexus mark. Web reference `ClassroomHeader.vue` L43–67.
-struct NexusMarkLogo: View {
+private enum EduskitMarkImage {
+    static let image: UIImage = {
+        guard let path = Bundle.module.path(forResource: "eduskit-mark", ofType: "png"),
+              let loaded = UIImage(contentsOfFile: path) else {
+            return UIImage()
+        }
+        return loaded
+    }()
+}
+
+struct EduskitMark: View {
     let size: CGFloat
     var body: some View {
-        Canvas { ctx, canvasSize in
-            let s = min(canvasSize.width, canvasSize.height)
-            let stroke: CGFloat = 2.5
-            // Outer rounded rect stroke
-            let rectPath = Path(roundedRect: CGRect(
-                x: stroke / 2, y: stroke / 2,
-                width: s - stroke, height: s - stroke
-            ), cornerRadius: 3)
-            ctx.stroke(rectPath, with: .color(EduColors.primary), lineWidth: stroke)
-            // Play triangle 12,10 → 12,22 → 23,16 (viewBox 32)
-            let scale = s / 32
-            var tri = Path()
-            tri.move(to: CGPoint(x: 12 * scale, y: 10 * scale))
-            tri.addLine(to: CGPoint(x: 12 * scale, y: 22 * scale))
-            tri.addLine(to: CGPoint(x: 23 * scale, y: 16 * scale))
-            tri.closeSubpath()
-            ctx.fill(tri, with: .color(EduColors.primary))
-            // Small circle bottom-right (cx=24, cy=24, r=4, stroke=2 surface-lowest)
-            let dot = Path(ellipseIn: CGRect(
-                x: 20 * scale, y: 20 * scale, width: 8 * scale, height: 8 * scale
-            ))
-            ctx.fill(dot, with: .color(EduColors.primaryContainer))
-            ctx.stroke(dot, with: .color(EduColors.surfaceLowest), lineWidth: 2)
-        }
-        .frame(width: size, height: size)
+        Image(uiImage: EduskitMarkImage.image)
+            .resizable()
+            .frame(width: size, height: size)
+            .accessibilityHidden(true)
     }
 }
 
@@ -200,6 +189,7 @@ struct StatusChip: View {
 struct ContentCanvasView: View {
     let document: DemoDocument
     var compact: Bool = false
+    var immersive: Bool = false
     var isFullscreen: Bool = false
     /// Trailing inset so landscape stage toggle does not cover header actions.
     var headerEndInset: CGFloat = 0
@@ -212,6 +202,7 @@ struct ContentCanvasView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if compact { DocBody(compact: true).frame(maxWidth: .infinity, maxHeight: .infinity) }
             // Header 保留外部回调（保持 DemoDocument 显示态），同时把动作转发到 WhiteboardHost。
             DocHeader(
                 document: document, compact: compact, isFullscreen: isFullscreen,
@@ -235,13 +226,14 @@ struct ContentCanvasView: View {
                 },
                 onFullscreen: onFullscreen
             )
-            DocBody(compact: compact)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(height: immersive ? 0 : nil).clipped().accessibilityHidden(immersive)
+            if !compact { DocBody(compact: false).frame(maxWidth: .infinity, maxHeight: .infinity) }
         }
         .background(EduColors.surfaceLowest)
         .clipped()
         .clipShape(RoundedRectangle(cornerRadius: compact ? 0 : EduDimens.radiusFull, style: .continuous))
-        .padding(compact ? 0 : 16)
+        .padding(.horizontal, compact ? 0 : 16)
+        .padding(.vertical, compact ? 0 : 16)
         .eduShadow(compact ? .soft : .soft)
     }
 }
@@ -292,6 +284,28 @@ private struct DocHeader: View {
     }
 
     var body: some View {
+        if compact {
+            HStack(spacing: 0) {
+                Text(EduI18n.text(host.hasCourseware ? "controlSlides" : "whiteboardFallbackTitle")).font(.system(size: 12)).foregroundStyle(EduColors.onSurfaceVariant).accessibilityLabel(headerTitle)
+                    .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading).padding(.leading, 12)
+                if host.hasCourseware {
+                    compactControl(EduIcons.chevronLeft, label: EduI18n.text("ariaPrevBoard"), action: onPrevPage)
+                        .disabled(!host.canPrevPage || whiteboardPermissionDenied)
+                    Text("\(host.boardIndex) / \(host.boardTotal)").font(.system(size: 12)).foregroundStyle(EduColors.onSurfaceVariant)
+                    compactControl(EduIcons.chevronRight, label: EduI18n.text("ariaNextBoard"), action: onNextPage)
+                        .disabled(!host.canNextPage || whiteboardPermissionDenied)
+                    compactControl(EduIcons.gridView, label: EduI18n.text("classroomAction_operate_courseware"), action: onOpenThumbnails)
+                }
+                compactControl(isFullscreen ? EduIcons.fullscreenExit : EduIcons.fullscreen,
+                    label: EduI18n.text("ariaFullscreen"), action: onFullscreen)
+            }.frame(height: 44).background(EduColors.surfaceLowest)
+        } else { desktopBody }
+    }
+    private func compactControl(_ icon: String, label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) { EduIcon(icon, size: 20, tint: EduColors.onSurfaceVariant).frame(width: 44, height: 44) }
+            .buttonStyle(.plain).accessibilityLabel(label)
+    }
+    private var desktopBody: some View {
         HStack(spacing: DocHeaderTokens.actionSpacing) {
             EduIcon(
                 EduIcons.description,

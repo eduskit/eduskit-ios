@@ -8,6 +8,7 @@ import EduSDK
 ///
 /// 横屏水平 Safe Area 只避让**刘海所在一侧**，另一侧贴边充满以提高空间利用率。
 struct LandscapeClassroomLayout: View {
+    let toolsPanel: () -> AnyView
     let snapshot: UiSnapshot
     let title: String
     let elapsedLabel: String
@@ -24,7 +25,7 @@ struct LandscapeClassroomLayout: View {
     var onToggleVideoWall: () -> Void
     var onEnd: () -> Void
     var onBack: () -> Void
-    var onSendMessage: (String) -> Void
+    var onSendMessage: (String) async -> Bool
     var onRefreshMembers: () -> Void
     var onLoadMoreMembers: () -> Void = {}
     var onLoadMemberActions: (String, @escaping ([MemberActionAvailability]) -> Void) -> Void = { _, callback in callback([]) }
@@ -34,6 +35,8 @@ struct LandscapeClassroomLayout: View {
     var onRequestInteraction: (String) -> Void = { _ in }
     var onToggleMicrophone: () -> Void = {}
     var onToggleCamera: () -> Void = {}
+    var onToggleHand: () -> Void = {}
+    var onToggleScreenShare: () -> Void = {}
     var featuredTeacher: ClassroomParticipant? = nil
 
     @State private var stageOpen = true
@@ -76,7 +79,8 @@ struct LandscapeClassroomLayout: View {
                 .zIndex(LandscapeLayoutTokens.stageDrawerZIndex)
 
                 RightSideDrawer(
-                    members: members,
+                        toolsPanel: toolsPanel,
+                    members: snapshot.classroomView.memberDirectory,
                     onStageUsers: snapshot.onStage,
                     membersNextCursor: snapshot.membersNextCursor,
                     membersLoading: snapshot.membersLoading,
@@ -162,7 +166,11 @@ struct LandscapeClassroomLayout: View {
                         videoMuted: snapshot.videoMuted,
                         onToggleMicrophone: onToggleMicrophone,
                         onToggleCamera: onToggleCamera,
-                        permissionDeniedActions: snapshot.permissionDeniedActions,
+                        toolbarEntries: snapshot.toolbarEntries,
+                        handRaised: snapshot.handRaised,
+                        localScreenSharing: snapshot.localScreenSharing,
+                        onToggleHand: onToggleHand,
+                        onToggleScreenShare: onToggleScreenShare,
                         showCourseware: !videoMainStage,
                         canEndClass: snapshot.canEndClass,
                         onInteract: { activity.bump() }
@@ -194,7 +202,9 @@ struct LandscapeClassroomLayout: View {
     @ViewBuilder
     private var whiteboardLayer: some View {
         Group {
-            if videoMainStage {
+            if let sharing = snapshot.screenSharePresenter() {
+                ScreenShareStageView(userId: sharing.userId, displayName: sharing.displayName)
+            } else if videoMainStage {
                 MainVideoStageView(teacher: featuredTeacher, showLiveBadge: snapshot.needLive)
             } else {
                 ContentCanvasView(
